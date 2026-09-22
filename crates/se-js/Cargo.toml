@@ -1,0 +1,27 @@
+[package]
+name = "se-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+se-dom = { path = "../se-dom" }
+se-net = { path = "../se-net" }
+serde_json = "1.0.151"
+thiserror = "2"
+url = "2"
+v8 = "152.2.0"
+# OS randomness for crypto.getRandomValues / randomUUID. Already in the
+# workspace lockfile tree (pulled transitively), so offline resolution works.
+getrandom = "0.2"
+
+[dev-dependencies]
+# TLS test fixtures for the page-fetch ALPN slice: an h2 (and h1.1-fallback)
+# server behind a self-signed loopback cert. Same versions the reqwest tree
+# already locks, so no new lockfile entries.
+bytes = "1"
+h2 = "0.4"
+http = "1"
+rustls = "0.23"
+tokio = "1"
+tokio-rustls = "0.26"

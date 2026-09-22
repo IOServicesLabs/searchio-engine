@@ -1,0 +1,37 @@
+[package]
+name = "se-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+# Encoders for the content-encoding wire test — same crates reqwest's
+# gzip/brotli/zstd features decode with, so no new lockfile entries.
+brotli = "8"
+flate2 = "1"
+zstd = "0.13"
+
+[dependencies]
+# h2cap (the raw-h2 ground-truth capture fixture) is a bin + library module,
+# so its deps ride the real dependency table. Same versions the reqwest tree
+# already locks — no new lockfile entries.
+bytes = "1"
+h2 = "0.4"
+http = "1"
+rustls = "0.23"
+tokio-rustls = "0.26"
+# The agent's WebSocket tier (firing 39): hand-rolled RFC 6455 client — OS
+# randomness for the handshake key + frame masking, native roots for wss://.
+# Both versions the reqwest/rustls tree already locks.
+getrandom = "0.4"
+rustls-native-certs = "0.8"
+cookie = "0.18"
+cookie_store = "0.22"
+# Body decoding the way a browser does it (content-type charset + the HTML
+# meta prescan): WHATWG label->encoding resolution. Already locked at 0.8.35
+# in the workspace tree — no new lockfile entries.
+encoding_rs = "0.8"
+reqwest = { version = "0.13.4", features = ["cookies", "gzip", "brotli", "zstd", "deflate"] }
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["full"] }
+url = "2"

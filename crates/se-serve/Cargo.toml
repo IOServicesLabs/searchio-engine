@@ -1,0 +1,17 @@
+[package]
+name = "se-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+se-dom = { version = "0.1.0", path = "../se-dom" }
+se-js = { version = "0.1.0", path = "../se-js" }
+se-net = { version = "0.1.0", path = "../se-net" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+# Relative <img src> resolution in the read_image verb — same url crate the
+# se-net tree already locks, no new lockfile entries.
+url = "2"

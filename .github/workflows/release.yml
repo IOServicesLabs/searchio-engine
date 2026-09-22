@@ -1,0 +1,76 @@
+name: release
+
+# Tag a release (v*.*.*) to build se-serve binaries for every supported
+# platform and attach them to the GitHub release. The searchio package and
+# Docker image consume these; the install script is:
+#
+#   https://github.com/IOServicesLabs/searchio-engine/releases/latest/download/install.sh
+#
+# (or drop the binary at ~/.searchio/bin/se-serve — searchio discovers it).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: se-serve (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin: se-serve
+            archive: se-serve-x86_64-unknown-linux-gnu.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            bin: se-serve
+            archive: se-serve-aarch64-unknown-linux-gnu.tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: se-serve.exe
+            archive: se-serve-x86_64-pc-windows-msvc.zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bin: se-serve
+            archive: se-serve-aarch64-apple-darwin.tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bin: se-serve
+            archive: se-serve-x86_64-apple-darwin.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (release)
+        run: cargo build --release --locked --bin se-serve --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          d="se-serve-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$d"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$d/"
+          cp README.md LICENSE "$d/"
+          tar czf "${{ matrix.archive }}" "$d"
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $d = "se-serve-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $d/
+          Copy-Item README.md, LICENSE $d/
+          Compress-Archive -Path $d -DestinationPath "${{ matrix.archive }}"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}

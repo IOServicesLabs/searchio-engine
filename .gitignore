@@ -1,0 +1,22 @@
+target/
+target-net/
+**/*.rs.bk
+*.log
+.env
+
+# python tooling run inside the repo (probe scripts)
+__pycache__/
+*.pyc
+
+# Local agent/worktree settings
+.claude/
+
+# Development-only content: kept locally, never published
+docs/
+
+# Development probes (kept locally, never published)
+scripts/probe_*.py
+scripts/capture_*.py
+scripts/bench_diff.py
+scripts/live_*.py
+scripts/f*_probe.py

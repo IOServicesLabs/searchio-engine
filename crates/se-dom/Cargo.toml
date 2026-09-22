@@ -1,0 +1,17 @@
+[package]
+name = "se-dom"
+description = "HTML5 document model for the searchio scraping engine: parse, select, serialize."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scraper.workspace = true
+ego-tree = "0.10"
+thiserror.workspace = true
+# Attribute mutation (set/remove) constructs QualName/LocalName the same
+# way scraper's own node layer does — scraper re-exports html5ever's types
+# but not the constructors this needs.
+html5ever = "0.29"
+# Snapshot entries serialize straight to the read_snapshot wire shape.
+serde = { version = "1", features = ["derive"] }

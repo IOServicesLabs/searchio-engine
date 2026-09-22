@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/se-dom", "crates/se-js", "crates/se-net", "crates/se-serve",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+scraper = "0.23"
+thiserror = "2"

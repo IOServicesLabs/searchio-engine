@@ -13,16 +13,24 @@ env:
 jobs:
   test:
     name: cargo test (${{ matrix.os }})
+    # Past 30 minutes a leg is hung; without a cap it bills to the 6-hour
+    # default.
+    timeout-minutes: 30
     strategy:
-      fail-fast: false
+      # One OS failing almost always means the other repeats it - stop the
+      # 2x-billing Windows leg instead of letting both run to completion.
+      fail-fast: true
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS bills at 10x and release.yml already builds the Darwin
+        # binaries, so per-push/PR CI doesn't need it (the same trade
+        # SwarmIO's ci.yml documents).
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace --locked
+      # No separate build step: cargo test compiles every target anyway, so a
+      # build step first would just pay the link cost twice.
       - name: Test
         run: cargo test --workspace --locked

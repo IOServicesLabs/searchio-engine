@@ -11,10 +11,29 @@
 use std::sync::Once;
 
 pub mod bridge;
+mod modules;
+pub use modules::code_cache_stats;
 mod sha256;
 pub mod audio;
 
 static INIT: Once = Once::new();
+
+/// Set by the near-heap-limit callback; read (and cleared) by `recover`.
+static HEAP_TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// V8 calls this when the heap approaches the configured ceiling. Returning
+/// the same limit makes V8 abort the process; instead the running script is
+/// terminated and the limit is raised just enough for the unwind to finish.
+unsafe extern "C" fn near_heap_limit(
+    data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    let handle = &*(data as *const v8::IsolateHandle);
+    handle.terminate_execution();
+    HEAP_TRIPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+    current_heap_limit + 64 * 1024 * 1024
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,8 +67,56 @@ impl Runtime {
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
         });
-        let i = v8::Isolate::new(v8::CreateParams::default());
+        // SE_JS_HEAP_MB (0 / unset = V8's own default, no cap): an old-space
+        // ceiling per isolate. Near the ceiling the callback below terminates
+        // the running script instead of letting V8 hit its fatal
+        // out-of-memory path, which takes the whole sidecar process down.
+        let heap_mb: usize = std::env::var("SE_JS_HEAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let mut params = v8::CreateParams::default();
+        if heap_mb > 0 {
+            params = params.heap_limits(0, heap_mb * 1024 * 1024);
+        }
+        let mut i = v8::Isolate::new(params);
+        // `import()` from any script or module goes through the module loader.
+        i.set_host_import_module_dynamically_callback(modules::dynamic_import_cb);
+        if heap_mb > 0 {
+            // One isolate for the life of the process: the handle is leaked
+            // on purpose so the callback's data pointer never dangles.
+            let handle: &'static v8::IsolateHandle = Box::leak(Box::new(i.thread_safe_handle()));
+            i.add_near_heap_limit_callback(
+                near_heap_limit,
+                handle as *const v8::IsolateHandle as *mut std::ffi::c_void,
+            );
+        }
         Self { isolate: i }
+    }
+
+    /// A handle another thread may use to stop a runaway script
+    /// (`terminate_execution`). The embedder's watchdog holds one.
+    pub fn handle(&self) -> v8::IsolateHandle {
+        self.isolate.thread_safe_handle()
+    }
+
+    /// Call after an eval that a watchdog or the heap ceiling cut short:
+    /// clears the pending termination so the NEXT eval runs (a terminate
+    /// that lands just after a script finished would otherwise kill it),
+    /// and asks V8 to drop what the dead script allocated. Returns whether
+    /// the heap ceiling was what tripped.
+    pub fn recover(&mut self) -> bool {
+        self.isolate.cancel_terminate_execution();
+        let heap = HEAP_TRIPPED.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if heap {
+            self.isolate.low_memory_notification();
+        }
+        heap
+    }
+
+    /// Whether the heap ceiling terminated a script since the last `recover`.
+    pub fn heap_tripped() -> bool {
+        HEAP_TRIPPED.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Eval `source` with no page loaded (about:blank semantics):
@@ -127,6 +194,8 @@ impl Runtime {
         );
         let scope = &mut v8::ContextScope::new(scope, context);
         bridge::finalize_context(scope, &mut state);
+        // The module registry lives exactly as long as this context.
+        let _modules = modules::begin(ptr);
         // Wrap the user source in a try/catch that funnels a sync throw into
         // the bridge's `__seThrow` host fn. This is what carries the
         // exception's MESSAGE over the wire (previously "<v8 gave no
@@ -216,6 +285,17 @@ impl Runtime {
                 }
             }
         };
+        // A JS-side live DOM (se-serve's livedom.js) serializes itself here,
+        // after the pump: `__seLiveFlush` calls `__seCommitHTML`, and the
+        // writeback below publishes it. Absent on every other eval.
+        if page.is_some() && !scope.is_execution_terminating() {
+            let flush = "if (typeof __seLiveFlush === 'function') { try { __seLiveFlush(); } catch (e) {} }";
+            if let Some(code) = v8::String::new(scope, flush) {
+                if let Some(script) = v8::Script::compile(scope, code, None) {
+                    let _ = script.run(scope);
+                }
+            }
+        }
         if let Some(p) = page {
             state.flush_writeback(p);
         }

@@ -320,6 +320,52 @@ fn escape_text_node(s: &str) -> String {
 /// `settle`; this stays the default for plain evals.
 pub const TIMER_BUDGET: Duration = Duration::from_secs(5);
 
+/// Quiescence exit for the settle pump (0 = off, the default): when only
+/// REPEATING timers remain (setInterval, a requestAnimationFrame loop) and
+/// this many consecutive rounds changed neither the DOM nor the network log,
+/// the page has settled and the pump stops instead of burning the whole
+/// budget on a carousel tick. Set by the embedder before an eval; one JS
+/// thread reads it, so a plain atomic is enough.
+pub fn set_quiesce_rounds(n: u32) {
+    QUIESCE_ROUNDS.with(|q| q.set(n));
+}
+thread_local! {
+    // Per JS thread: with several isolates each eval reads its own options.
+    static QUIESCE_ROUNDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PAGE_FETCH_REFERER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn set_page_fetch_referer(on: bool) {
+    PAGE_FETCH_REFERER.with(|q| q.set(on));
+}
+/// Page-context fetch/XHR carry `Referer` / `Origin` the way Chrome's default
+/// referrer policy sends them (off = the header set before this switch).
+
+/// `fetch()` returns at once and its promise settles from the event-loop
+/// pump when the answer lands, so a page's parallel requests overlap instead
+/// of each parking the one JS thread until its answer arrives (off = every
+/// fetch blocks the isolate for its whole round trip).
+/// Render option `quiet_ms`: a page whose DOM and network have been still for
+/// this long, with nothing in flight and no one-shot timer due within the
+/// same span, is done -- a far `setTimeout` (an analytics beacon, a session
+/// poll) no longer holds the pump to the end of the budget. 0 = off.
+/// Per JS thread (set by the thread that runs the eval), so two engines in
+/// one process do not see each other's value.
+pub fn set_quiet_ms(ms: u64) {
+    QUIET_MS.with(|q| q.set(ms));
+}
+thread_local! {
+    static QUIET_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub fn set_async_fetch(on: bool) {
+    ASYNC_FETCH.with(|a| a.set(on));
+}
+thread_local! {
+    static ASYNC_FETCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Never declare quiescence earlier than this into the pump: a framework's
+/// first paint is often one macrotask after its bundle evaluates.
+const QUIESCE_MIN: Duration = Duration::from_millis(120);
+
 /// The UA string this engine presents. It is what
 /// `SidecarClient.user_agent()` reads back via eval, and clearance cookies
 /// bind to it, so it must be stable for the process lifetime.
@@ -472,6 +518,13 @@ pub struct State {
     /// into the page's writeback slot; the tab owner adopts it post-eval, so
     /// mutations persist across evals instead of dying with the eval's State.
     mutated: bool,
+    /// Bumped by every successful DOM mutation (quiescence test).
+    dom_gen: u64,
+    /// Page-initiated fetch/XHR hops this eval performed.
+    net_hops: u64,
+    /// `fetch()` calls in flight (ASYNC_FETCH): the answer channel and the
+    /// promise callbacks the pump calls when it lands.
+    pending_fetches: Vec<PendingFetch>,
     /// Live MutationObserver registrations and their pending records
     /// (firing 24). Registrations are standing filters evaluated at every
     /// mutation choke point; matched records wait here for the same
@@ -567,12 +620,21 @@ impl State {
             history_states: vec![None],
             listeners: Vec::new(),
             mutated: false,
+            dom_gen: 0,
+            net_hops: 0,
+            pending_fetches: Vec::new(),
             mutation_targets: Vec::new(),
             mutation_records: Vec::new(),
             fp_tostring_orig: None,
             fp_masks: Vec::new(),
             idb_error_fn: None,
         }
+    }
+
+    /// Page-initiated network activity so far (fetch/XHR hops this eval
+    /// logged): the quiescence test's "is anything still arriving" signal.
+    fn net_events(&self) -> u64 {
+        self.net_hops
     }
 
     fn doc(&mut self) -> &Document {
@@ -613,6 +675,7 @@ impl State {
         self.html = doc.html();
         self.doc = Some(doc);
         self.mutated = true;
+        self.dom_gen = self.dom_gen.wrapping_add(1);
         true
     }
 
@@ -927,12 +990,11 @@ impl LocationParts {
     }
 }
 
-/// Serialize `s` (including lone surrogates) to UTF-8 lossily, the way the
-/// eventual `TextDecoder` tier will do it.
+/// A Rust `&str` as a JS string. (This used to hand the UTF-8 BYTES to V8's
+/// Latin-1 constructor, so every multi-byte character in a fetch body, a
+/// storage value or a cookie arrived as mojibake: "né" read back "nÃ©".)
 fn js_string<'s, 'i>(scope: &mut PinScope<'s, 'i>, s: &str) -> Local<'s, Value> {
-    v8::String::new_from_one_byte(scope, s.as_bytes(), v8::NewStringType::Normal)
-        .expect("string alloc")
-        .into()
+    v8::String::new(scope, s).expect("string alloc").into()
 }
 
 /// Read a `Local<Object>`'s string property, if present.
@@ -1249,6 +1311,23 @@ fn read_fetch_chunked(
     }
 }
 
+/// A module dependency's source, through the page's own network path (jar,
+/// guard, redirects): 2xx text or the reason it is not one.
+pub(crate) fn fetch_text(st: &mut State, url: &str) -> Result<String, String> {
+    let resp = blocking_fetch(st, "script", url, &FetchSpec::get(), &mut || {})?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("HTTP {}", resp.status));
+    }
+    Ok(resp.body)
+}
+
+/// One `fetch()` whose answer has not landed yet.
+struct PendingFetch {
+    rx: std::sync::mpsc::Receiver<Result<se_net::Response, String>>,
+    resolve: v8::Global<Function>,
+    reject: v8::Global<Function>,
+}
+
 fn blocking_fetch(
     st: &mut State,
     kind: &str,
@@ -1256,6 +1335,24 @@ fn blocking_fetch(
     spec: &FetchSpec,
     pump: &mut dyn FnMut(),
 ) -> Result<se_net::Response, String> {
+    let rx = start_fetch(st, kind, raw, spec);
+    // Bounded wait: every hop inside the thread carries its own deadline,
+    // but an unbounded recv here pinned the one JS thread on any gap in them.
+    let r = rx
+        .recv_timeout(Duration::from_secs(60))
+        .map_err(|e| format!("page fetch: no answer within 60s ({e})"))?;
+    st.net_hops = st.net_hops.wrapping_add(1);
+    pump();
+    r
+}
+
+/// Send the request on its own thread and hand back the answer channel.
+fn start_fetch(
+    st: &mut State,
+    kind: &str,
+    raw: &str,
+    spec: &FetchSpec,
+) -> std::sync::mpsc::Receiver<Result<se_net::Response, String>> {
     let url = absolutize(raw, &st.page_url);
     // Subresource presentation: a real Chrome page fetch/XHR carries client
     // hints + Fetch Metadata — and NOT the navigation markers (Upgrade-
@@ -1291,6 +1388,36 @@ fn blocking_fetch(
         ("Accept".into(), "*/*".into()),
         ("Accept-Language".into(), "en-US,en;q=0.9".into()),
     ];
+    // Referer and Origin, as Chrome's default policy
+    // (strict-origin-when-cross-origin) sends them from a page: the full
+    // page URL (no fragment) to the same origin, the bare origin across
+    // origins, nothing from https down to http; Origin on every cross-origin
+    // request and on every non-GET/HEAD one. An XHR endpoint behind a CSRF
+    // or WAF check refuses a request that carries neither.
+    if PAGE_FETCH_REFERER.with(|q| q.get()) {
+        if let Ok(page) = url::Url::parse(&st.page_url) {
+            if matches!(page.scheme(), "http" | "https") {
+                let same = fetch_site == "same-origin";
+                let downgrade = page.scheme() == "https" && url.starts_with("http://");
+                let origin = page.origin().ascii_serialization();
+                if !downgrade {
+                    let referer = if same {
+                        let mut p = page.clone();
+                        p.set_fragment(None);
+                        let _ = p.set_username("");
+                        let _ = p.set_password(None);
+                        p.to_string()
+                    } else {
+                        format!("{origin}/")
+                    };
+                    headers.push(("Referer".into(), referer));
+                }
+                if !same || !matches!(spec.method.as_str(), "GET" | "HEAD") {
+                    headers.push(("Origin".into(), origin));
+                }
+            }
+        }
+    }
     // A body lands its length (and a default content type, the fetch spec's
     // string-body default) unless the caller set their own.
     let sends_body = !matches!(spec.method.as_str(), "GET" | "HEAD") || !spec.body.is_empty();
@@ -1554,9 +1681,47 @@ fn blocking_fetch(
         })();
         let _ = tx.send(result);
     });
-    let r = rx.recv().map_err(|e| format!("recv: {e}"))?.map_err(|e| e);
-    pump();
-    r
+    rx
+}
+
+/// Settle every in-flight `fetch()` whose answer has landed. Returns how
+/// many settled; the caller runs a microtask checkpoint after.
+fn drain_fetches<'s, 'i>(state: &mut State, scope: &mut PinScope<'s, 'i>) -> usize {
+    if state.pending_fetches.is_empty() {
+        return 0;
+    }
+    let state_ptr = state as *mut State;
+    let mut done = 0usize;
+    let mut i = 0usize;
+    while i < unsafe { &*state_ptr }.pending_fetches.len() {
+        let got = match unsafe { &*state_ptr }.pending_fetches[i].rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("page fetch: worker ended without an answer".to_string())
+            }
+        };
+        let job = unsafe { &mut *state_ptr }.pending_fetches.swap_remove(i);
+        unsafe { &mut *state_ptr }.net_hops = unsafe { &*state_ptr }.net_hops.wrapping_add(1);
+        done += 1;
+        let resolve_fn = v8::Local::new(scope, &job.resolve);
+        let reject_fn = v8::Local::new(scope, &job.reject);
+        match got {
+            Ok(resp) => {
+                let resp_obj = response_object_in(scope, unsafe { &mut *state_ptr }, &resp);
+                let call_args = &[resp_obj.into()];
+                let _ = resolve_fn.call(scope, v8::undefined(scope).into(), call_args);
+            }
+            Err(msg) => {
+                let reason = format!("TypeError: failed to fetch ({msg})");
+                reject_with(scope, reject_fn, &reason);
+            }
+        }
+    }
+    done
 }
 
 /// Set a value on `obj` with best-effort result checking.
@@ -1583,6 +1748,15 @@ fn response_object<'s, 'i>(
     args: &FunctionCallbackArguments<'_>,
     resp: &se_net::Response,
 ) -> Local<'s, Object> {
+    let st = unsafe { state_of(args) };
+    response_object_in(scope, st, resp)
+}
+
+fn response_object_in<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    st: &mut State,
+    resp: &se_net::Response,
+) -> Local<'s, Object> {
     let obj = v8::Object::new(scope);
     set_prop(scope, obj, "status", v8::Number::new(scope, resp.status as f64).into());
     set_prop(scope, obj, "url", sv(scope, &resp.final_url));
@@ -1596,7 +1770,6 @@ fn response_object<'s, 'i>(
 
     // Stash the body and point `text()` at it by index.
     let body_index = {
-        let st = unsafe { state_of(args) };
         st.response_bodies.push(resp.body.clone());
         st.response_bodies.len() - 1
     };
@@ -1606,12 +1779,10 @@ fn response_object<'s, 'i>(
         "_body_index",
         v8::Number::new(scope, body_index as f64).into(),
     );
-    let text_fn = {
-        let st = unsafe { state_of(args) };
-        st.text_template
-            .as_ref()
-            .and_then(|tpl| v8::Local::new(nullscope(scope), tpl).get_function(scope))
-    };
+    let text_fn = st
+        .text_template
+        .as_ref()
+        .and_then(|tpl| v8::Local::new(nullscope(scope), tpl).get_function(scope));
     if let Some(f) = text_fn {
         set_prop(scope, obj, "text", f.into());
     }
@@ -1689,6 +1860,20 @@ fn cb_fetch<'s, 'i>(
     // The fetch spec: GET/HEAD never carry a body, whatever the caller passed.
     if matches!(spec.method.as_str(), "GET" | "HEAD") {
         spec.body.clear();
+    }
+    if ASYNC_FETCH.with(|a| a.get()) {
+        // Send now, settle from the pump: the script keeps running and its
+        // other requests overlap this one.
+        let st = unsafe { &mut *state_ptr };
+        let rx = start_fetch(st, "fetch", &raw, &spec);
+        st.pending_fetches.push(PendingFetch {
+            rx,
+            resolve: resolve_root,
+            reject: reject_root,
+        });
+        resolver.resolve(scope, v8::undefined(scope).into());
+        rv.set(promise.into());
+        return;
     }
     let mut pump = || pump_microtasks(scope);
     let result = {
@@ -8484,6 +8669,66 @@ fn cb_webgl_is_context_lost<'s, 'i>(
     rv.set(v8::Boolean::new(scope, false).into());
 }
 
+// ── live DOM host functions ─────────────────────────────────────────────────
+// se-serve's `livedom.js` keeps the document as a tree of JS objects. These
+// four are everything it needs from the host: the parser, the page's HTML,
+// a "the DOM changed" tick for the settle pump's quiescence test, and the
+// commit that hands the final document back to the tab.
+
+/// `__seParseHTML(html, fragment)`: the html5ever parse as a JSON tree
+/// (`se_dom::jsontree`).
+fn cb_live_parse<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    mut rv: ReturnValue<'s, Value>,
+) {
+    let html = arg_string(scope, &args, 0).unwrap_or_default();
+    let fragment = args.get(1).boolean_value(scope);
+    let tree = if fragment {
+        se_dom::jsontree::fragment_tree(&html)
+    } else {
+        se_dom::jsontree::document_tree(&html)
+    };
+    rv.set(js_string(scope, &tree).into());
+}
+
+/// `__sePageHTML()`: the document this eval started from.
+fn cb_live_page_html<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    mut rv: ReturnValue<'s, Value>,
+) {
+    let st = unsafe { state_of(&args) };
+    let html = st.html.clone();
+    rv.set(js_string(scope, &html).into());
+}
+
+/// `__seDomTick()`: a JS-side mutation happened.
+fn cb_live_tick<'s, 'i>(
+    _scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    _rv: ReturnValue<'s, Value>,
+) {
+    let st = unsafe { state_of(&args) };
+    st.dom_gen = st.dom_gen.wrapping_add(1);
+}
+
+/// `__seCommitHTML(html)`: the serialized live document becomes the eval's
+/// document, published through the ordinary mutation writeback.
+fn cb_live_commit<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    _rv: ReturnValue<'s, Value>,
+) {
+    let Some(html) = arg_string(scope, &args, 0) else { return };
+    let st = unsafe { state_of(&args) };
+    if st.html != html {
+        st.html = html;
+        st.doc = None;
+        st.mutated = true;
+    }
+}
+
 fn cb_resolve<'s, 'i>(
     scope: &mut PinScope<'s, 'i>,
     args: FunctionCallbackArguments<'s>,
@@ -9134,11 +9379,14 @@ pub fn build_globals<'s, 'i>(
     // flag the same way.
     let navigator = ObjectTemplate::new(scope);
     navigator.prop(scope, "userAgent", s_pre(scope, USER_AGENT).into());
+    // appVersion is the User-Agent without its "Mozilla/" lead, as in Chrome
+    // (a script that compares the two saw a truncated one here).
     navigator.prop(
         scope,
         "appVersion",
-        s_pre(scope, "5.0 (Windows NT 10.0; Win64; x64)").into(),
+        s_pre(scope, USER_AGENT.strip_prefix("Mozilla/").unwrap_or(USER_AGENT)).into(),
     );
+    navigator.prop(scope, "appCodeName", s_pre(scope, "Mozilla").into());
     navigator.prop(scope, "appName", s_pre(scope, "Netscape").into());
     navigator.prop(scope, "product", s_pre(scope, "Gecko").into());
     navigator.prop(scope, "productSub", s_pre(scope, "20030107").into());
@@ -9544,6 +9792,11 @@ pub fn build_globals<'s, 'i>(
     globals.prop(scope, "innerHeight", v8::Number::new(scope, 937.0).into());
     globals.prop(scope, "outerWidth", v8::Number::new(scope, 1920.0).into());
     globals.prop(scope, "outerHeight", v8::Number::new(scope, 1080.0).into());
+    // A maximized window on a 100%-scaled display.
+    globals.prop(scope, "devicePixelRatio", v8::Number::new(scope, 1.0).into());
+    for k in ["screenX", "screenY", "screenLeft", "screenTop"] {
+        globals.prop(scope, k, v8::Number::new(scope, 0.0).into());
+    }
     // Scroll position: real bookkeeping (scrollBy/scrollTo advance it,
     // clamped at zero) even though this tier has no viewport to move.
     globals.prop(scope, "scrollX", v8::Number::new(scope, 0.0).into());
@@ -10097,6 +10350,18 @@ pub fn build_globals<'s, 'i>(
     // the second argument and cb_fetch drives them by hand. One fetch per
     // eval (the page jar can't interleave them meaningfully at this tier).
     globals.prop(scope, "fetch", ft_pre(scope, ext, cb_fetch).into());
+    // Module loader + cached classic-script runner (see modules.rs); the
+    // render harness calls them when the embedder asks for either.
+    globals.prop(
+        scope,
+        "__seRunModule",
+        ft_pre(scope, ext, crate::modules::cb_run_module).into(),
+    );
+    globals.prop(
+        scope,
+        "__seRunScript",
+        ft_pre(scope, ext, crate::modules::cb_run_script).into(),
+    );
     let text_tpl = ft_pre(scope, ext, cb_response_text);
     unsafe {
         (*state_ptr).text_template = Some(v8::Global::new(scope, text_tpl));
@@ -10176,6 +10441,10 @@ pub fn build_globals<'s, 'i>(
     globals.prop(scope, "__seResolve", ft_pre(scope, ext, cb_resolve).into());
     globals.prop(scope, "__seReject", ft_pre(scope, ext, cb_reject).into());
     globals.prop(scope, "__seThrow", ft_pre(scope, ext, cb_throw).into());
+    globals.prop(scope, "__seParseHTML", ft_pre(scope, ext, cb_live_parse).into());
+    globals.prop(scope, "__sePageHTML", ft_pre(scope, ext, cb_live_page_html).into());
+    globals.prop(scope, "__seDomTick", ft_pre(scope, ext, cb_live_tick).into());
+    globals.prop(scope, "__seCommitHTML", ft_pre(scope, ext, cb_live_commit).into());
 
     // element wrapper template — stashed in State so callbacks can
     // instantiate more wrappers mid-eval.
@@ -10307,8 +10576,13 @@ pub fn finalize_context<'s, 'i>(scope: &mut PinScope<'s, 'i>, state: &mut State)
     // navigator.languages — Array needs a live context (see build_globals).
     if let Some(nav) = global.get(scope, sv(scope, "navigator")) {
         let nav = nav.cast::<Object>();
-        let langs = v8::Array::new_with_elements(scope, &[sv(scope, "en-US")]);
+        // The list the wire's Accept-Language ("en-US,en;q=0.9") implies.
+        let langs = v8::Array::new_with_elements(scope, &[sv(scope, "en-US"), sv(scope, "en")]);
         let _ = nav.set(scope, sv(scope, "languages"), langs.into());
+        // Object.prototype.toString.call(navigator / window), as a browser.
+        let tag = v8::Symbol::get_to_string_tag(scope);
+        let _ = nav.set(scope, tag.into(), sv(scope, "Navigator"));
+        let _ = global.set(scope, tag.into(), sv(scope, "Window"));
 
         // userAgentData.brands — from the SAME se-net constants the
         // Sec-CH-UA wire headers are built from; the two surfaces must
@@ -10924,15 +11198,73 @@ pub fn settle<'s, 'i>(
             let _ = promise.then2(scope, on_ok, on_err);
         }
     }
-    let deadline = Instant::now() + budget;
+    let pump_started = Instant::now();
+    let deadline = pump_started + budget;
+    let quiesce = QUIESCE_ROUNDS.with(|q| q.get());
+    let mut idle_rounds = 0u32;
+    let mut seen = (state.dom_gen, state.net_events());
+    let quiet = Duration::from_millis(QUIET_MS.with(|q| q.get()));
+    let mut quiet_mark = seen;
+    let mut quiet_since = pump_started;
     loop {
         scope.perform_microtask_checkpoint();
+        if drain_fetches(state, scope) > 0 {
+            // An answer landed: its continuation may queue more work.
+            idle_rounds = 0;
+            quiet_since = Instant::now();
+            continue;
+        }
         if state.resolved.is_some() || state.rejected.is_some() {
             break;
         }
         let now = Instant::now();
         if now >= deadline {
             break;
+        }
+        if !state.pending_fetches.is_empty() {
+            // A request in flight is not idleness: wait for it in short
+            // slices, firing whatever timer comes due meanwhile.
+            idle_rounds = 0;
+            let next_timer = state.timers.iter().map(|t| t.deadline).min();
+            let wake = next_timer.unwrap_or(deadline).min(deadline);
+            let slice = Duration::from_millis(1);
+            if wake > now {
+                std::thread::sleep(slice.min(wake - now));
+            }
+            if next_timer.is_some_and(|d| d <= Instant::now()) {
+                fire_due_timers(state, scope);
+            }
+            continue;
+        }
+        if !quiet.is_zero() && !tracked {
+            let mark = (state.dom_gen, state.net_events());
+            if mark != quiet_mark {
+                quiet_mark = mark;
+                quiet_since = now;
+            }
+            // Repeating timers are the quiesce rule's business; here only a
+            // one-shot that is about to fire keeps a still page waiting.
+            let soon = now + quiet;
+            let one_shot_soon = state
+                .timers
+                .iter()
+                .any(|t| t.interval_ms.is_none() && !t.raf && t.deadline <= soon);
+            if !one_shot_soon && now.duration_since(quiet_since) >= quiet {
+                break;
+            }
+        }
+        if quiesce > 0 && !tracked && !state.timers.is_empty() {
+            let mark = (state.dom_gen, state.net_events());
+            let only_repeating = state.timers.iter().all(|t| t.interval_ms.is_some() || t.raf);
+            if mark == seen && only_repeating {
+                idle_rounds += 1;
+                if idle_rounds >= quiesce && now.duration_since(pump_started) >= QUIESCE_MIN {
+                    break;
+                }
+            } else {
+                idle_rounds = 0;
+                seen = mark;
+            }
         }
         match state.timers.iter().map(|t| t.deadline).min() {
             None => break,
@@ -10942,7 +11274,11 @@ pub fn settle<'s, 'i>(
             // fire_due_timers only fires timers whose deadline passed, so the
             // extra budget wake simply fires nothing and the loop breaks.
             Some(d) => {
-                let wake = d.min(deadline);
+                let mut wake = d.min(deadline);
+                if !quiet.is_zero() && !tracked {
+                    // Come back when the quiet window could close.
+                    wake = wake.min((quiet_since + quiet).max(now + Duration::from_millis(1)));
+                }
                 if wake > now {
                     std::thread::sleep(wake - now);
                 }
@@ -10950,6 +11286,9 @@ pub fn settle<'s, 'i>(
             }
         }
     }
+    // Requests still in flight at the end of the pump are abandoned: their
+    // threads finish on their own deadlines and find the channel closed.
+    state.pending_fetches.clear();
     if !tracked {
         return Settled::Value;
     }

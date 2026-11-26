@@ -31,7 +31,107 @@ struct JsCmd {
     page: Option<Page>,
     js: String,
     budget: std::time::Duration,
+    opts: JsOpts,
     reply: tokio::sync::oneshot::Sender<(Result<Value, String>, Option<String>)>,
+}
+
+/// Per-call JS options, carried from a verb to the actor through a task
+/// local so the verb -> render -> eval call chain needs no extra arguments.
+#[derive(Clone, Copy, Default)]
+struct JsOpts {
+    /// Settle-pump quiescence rounds (0 = run the whole budget, the default).
+    quiesce: u32,
+    /// Page fetch/XHR send Referer / Origin as Chrome does.
+    page_referer: bool,
+    /// Render with the browser-globals prelude and the `load` lifecycle.
+    prelude: bool,
+    /// External scripts: fetched together, non-content hosts skipped,
+    /// wider caps (`script_pipeline: true`).
+    pipeline: bool,
+    /// Render against the JS-side live DOM (`live_dom: true`; needs `prelude`).
+    live_dom: bool,
+    /// Page fetches share one keep-alive transport and settle from the
+    /// event-loop pump instead of each blocking the isolate (`fetch_pool`).
+    fetch_pool: bool,
+    /// Run `<script type="module">` (static and dynamic imports) and skip
+    /// `nomodule` fallbacks (`modules: true`; needs `prelude`).
+    modules: bool,
+    /// Settle-pump quiet window in ms (`quiet_ms`; 0 = off): a still page
+    /// stops waiting on far one-shot timers.
+    quiet_ms: u64,
+    /// Classic scripts run as real Scripts with V8's code cache kept per
+    /// URL + content (`code_cache: true`; needs `prelude`).
+    code_cache: bool,
+}
+
+/// `script_pipeline` caps: a modern page ships its app as a dozen chunks and
+/// one of them is routinely over the 512 KB the serial path allows.
+const PIPELINE_MAX_EXTERNALS: usize = 24;
+const PIPELINE_MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
+const PIPELINE_MAX_TOTAL_BYTES: usize = 6 * 1024 * 1024;
+
+/// Hosts whose scripts measure, advertise or ask for consent. They draw no
+/// content, they cost a round trip each, and several of them are the sensor
+/// scripts that judge the client that runs them.
+fn noncontent_script(url: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "google-analytics.com", "googletagmanager.com", "googletagservices.com",
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+        "connect.facebook.net", "hotjar.com", "segment.com", "segment.io",
+        "amplitude.com", "mixpanel.com", "sentry-cdn.com", "sentry.io",
+        "newrelic.com", "nr-data.net", "clarity.ms", "optimizely.com",
+        "intercom.io", "intercomcdn.com", "fullstory.com", "scorecardresearch.com",
+        "quantserve.com", "cookiebot.com", "onetrust.com", "cookielaw.org",
+        "hs-scripts.com", "hs-analytics.net", "hsadspixel.net", "bat.bing.com",
+        "datadoghq-browser-agent.com", "analytics.tiktok.com", "snap.licdn.com",
+        "static.ads-twitter.com", "chartbeat.com", "criteo.net", "taboola.com",
+        "outbrain.com", "amazon-adsystem.com", "adnxs.com", "matomo.cloud",
+        "plausible.io", "usercentrics.eu", "trustarc.com", "crazyegg.com",
+    ];
+    let Ok(u) = url::Url::parse(url) else { return false };
+    let Some(host) = u.host_str().map(str::to_ascii_lowercase) else { return false };
+    if HOSTS.iter().any(|d| host == *d || host.ends_with(&format!(".{d}"))) {
+        return true;
+    }
+    let path = u.path();
+    (host.ends_with("google.com") || host.ends_with("gstatic.com")) && path.contains("/recaptcha/")
+}
+
+/// The browser globals a page expects before its first script (see the file).
+const PRELUDE_JS: &str = include_str!("prelude.js");
+/// The JS-side live DOM installed by `live_dom` renders (see the file head).
+const LIVEDOM_JS: &str = include_str!("livedom.js");
+
+tokio::task_local! {
+    static JS_OPTS: JsOpts;
+}
+
+/// Hard ceiling on one eval: its settle budget plus this grace. Past it the
+/// watchdog terminates the script (a `while(true){}` used to pin the single
+/// JS thread, and with it every tab, for the life of the process).
+/// SE_JS_GRACE_MS overrides; 0 turns the watchdog off.
+fn js_grace() -> Option<std::time::Duration> {
+    let ms: u64 = std::env::var("SE_JS_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20_000);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Shared between the JS thread and its watchdog: the running eval's hard
+/// deadline (None while idle) and whether the watchdog cut it short.
+#[derive(Default)]
+struct Watch {
+    deadline: Mutex<Option<std::time::Instant>>,
+    tripped: std::sync::atomic::AtomicBool,
+    evals: std::sync::atomic::AtomicU64,
+    killed: std::sync::atomic::AtomicU64,
+    panics: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+}
+
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Owns the V8 `Runtime` on a dedicated thread. Isolates are `!Send`, so
@@ -41,27 +141,105 @@ struct JsCmd {
 #[derive(Clone)]
 pub struct JsActor {
     tx: tokio::sync::mpsc::Sender<JsCmd>,
+    watch: Arc<Watch>,
 }
 
 impl Default for JsActor {
     fn default() -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<JsCmd>(16);
-        std::thread::spawn(move || {
-            let mut rt = se_js::Runtime::new();
-            while let Some(cmd) = rx.blocking_recv() {
-                let (out, nav) = rt.eval_with_page_with_nav(
-                    cmd.page.as_ref(),
-                    &cmd.js,
-                    cmd.budget,
-                );
-                let _ = cmd.reply.send((out.map_err(|e| e.to_string()), nav));
-            }
-        });
-        Self { tx }
+        Self::with_grace(js_grace())
     }
 }
 
 impl JsActor {
+    /// An actor whose watchdog allows `grace` past each eval's settle budget
+    /// (None = no watchdog).
+    fn with_grace(grace: Option<std::time::Duration>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<JsCmd>(16);
+        let watch = Arc::new(Watch::default());
+        let w = watch.clone();
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut rt = se_js::Runtime::new();
+            if grace.is_some() {
+                let handle = rt.handle();
+                let wd = w.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let due = lock_ok(&wd.deadline)
+                        .map(|d| std::time::Instant::now() >= d)
+                        .unwrap_or(false);
+                    if due && !wd.tripped.swap(true, SeqCst) {
+                        handle.terminate_execution();
+                    }
+                });
+            }
+            while let Some(cmd) = rx.blocking_recv() {
+                // The caller gave up (timeout, dropped connection): running
+                // its script would only delay the evals queued behind it.
+                if cmd.reply.is_closed() {
+                    w.skipped.fetch_add(1, SeqCst);
+                    continue;
+                }
+                se_js::bridge::set_quiesce_rounds(cmd.opts.quiesce);
+                se_js::bridge::set_page_fetch_referer(cmd.opts.page_referer);
+                se_js::bridge::set_async_fetch(cmd.opts.fetch_pool);
+                se_js::bridge::set_quiet_ms(cmd.opts.quiet_ms);
+                se_net::SUBRESOURCE_POOL.store(cmd.opts.fetch_pool, SeqCst);
+                w.evals.fetch_add(1, SeqCst);
+                w.tripped.store(false, SeqCst);
+                if let Some(g) = grace {
+                    *lock_ok(&w.deadline) = Some(std::time::Instant::now() + cmd.budget + g);
+                }
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.eval_with_page_with_nav(cmd.page.as_ref(), &cmd.js, cmd.budget)
+                }));
+                *lock_ok(&w.deadline) = None;
+                let timed_out = w.tripped.swap(false, SeqCst);
+                let (out, nav) = match ran {
+                    Ok((out, nav)) => (out.map_err(|e| e.to_string()), nav),
+                    Err(_) => {
+                        // A panic inside a bridge callback: the isolate's
+                        // state is unknown, so it is replaced, and the actor
+                        // lives on instead of taking every later eval down.
+                        w.panics.fetch_add(1, SeqCst);
+                        (Err("js runtime panicked; the script was abandoned".to_string()), None)
+                    }
+                };
+                let heap = rt.recover();
+                let out = if heap {
+                    w.killed.fetch_add(1, SeqCst);
+                    Err("script exceeded the JS heap limit and was terminated".to_string())
+                } else if timed_out {
+                    w.killed.fetch_add(1, SeqCst);
+                    Err(format!(
+                        "script exceeded its time limit ({} ms settle budget + grace) and was terminated",
+                        cmd.budget.as_millis()
+                    ))
+                } else {
+                    out
+                };
+                let _ = cmd.reply.send((out, nav));
+            }
+        });
+        Self { tx, watch }
+    }
+}
+
+impl JsActor {
+    /// Liveness and counters for the `health` verb.
+    fn health(&self) -> Value {
+        use std::sync::atomic::Ordering::SeqCst;
+        json!({
+            "alive": !self.tx.is_closed(),
+            "queue_free": self.tx.capacity(),
+            "busy": lock_ok(&self.watch.deadline).is_some(),
+            "evals": self.watch.evals.load(SeqCst),
+            "terminated": self.watch.killed.load(SeqCst),
+            "panics": self.watch.panics.load(SeqCst),
+            "skipped_abandoned": self.watch.skipped.load(SeqCst),
+        })
+    }
+
     async fn eval(&self, page: Option<Page>, js: String) -> Result<Value, String> {
         self.eval_with_budget(page, js, se_js::bridge::TIMER_BUDGET)
             .await
@@ -92,6 +270,7 @@ impl JsActor {
                 page,
                 js,
                 budget,
+                opts: JS_OPTS.try_with(|o| *o).unwrap_or_default(),
                 reply,
             })
             .await;
@@ -105,11 +284,105 @@ impl JsActor {
     }
 }
 
+/// How many isolates serve evals (`SE_JS_ISOLATES`, 1..=8; default 1).
+fn js_isolates() -> usize {
+    std::env::var("SE_JS_ISOLATES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+/// A pool of JS actors, one isolate and one thread each. Every eval builds a
+/// fresh context and its own DOM state, so any isolate can take any eval:
+/// with one isolate a slow render made every other tab's script wait behind
+/// it. An idle isolate is preferred; when all are busy the evals queue
+/// round-robin. Isolates past the first start on first need.
+#[derive(Clone)]
+pub struct JsPool {
+    workers: Arc<Mutex<Vec<JsActor>>>,
+    max: usize,
+    next: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Default for JsPool {
+    fn default() -> Self {
+        Self::with_size(js_isolates())
+    }
+}
+
+impl JsPool {
+    fn with_size(max: usize) -> Self {
+        Self {
+            workers: Arc::new(Mutex::new(vec![JsActor::default()])),
+            max: max.max(1),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn pick(&self) -> JsActor {
+        let mut workers = lock_ok(&self.workers);
+        let idle = |w: &JsActor| lock_ok(&w.watch.deadline).is_none() && w.tx.capacity() == w.tx.max_capacity();
+        if let Some(w) = workers.iter().find(|w| idle(w)) {
+            return w.clone();
+        }
+        if workers.len() < self.max {
+            let w = JsActor::default();
+            workers.push(w.clone());
+            return w;
+        }
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % workers.len();
+        workers[i].clone()
+    }
+
+    /// Liveness and counters for the `health` verb, summed over the pool.
+    fn health(&self) -> Value {
+        let workers = lock_ok(&self.workers);
+        let each: Vec<Value> = workers.iter().map(|w| w.health()).collect();
+        let sum = |k: &str| each.iter().filter_map(|h| h[k].as_u64()).sum::<u64>();
+        json!({
+            "alive": each.iter().all(|h| h["alive"] == json!(true)),
+            "queue_free": sum("queue_free"),
+            "busy": each.iter().any(|h| h["busy"] == json!(true)),
+            "busy_isolates": each.iter().filter(|h| h["busy"] == json!(true)).count(),
+            "isolates": each.len(),
+            "isolates_max": self.max,
+            "evals": sum("evals"),
+            "terminated": sum("terminated"),
+            "panics": sum("panics"),
+            "skipped_abandoned": sum("skipped_abandoned"),
+        })
+    }
+
+    async fn eval(&self, page: Option<Page>, js: String) -> Result<Value, String> {
+        self.pick().eval(page, js).await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn eval_with_budget(
+        &self,
+        page: Option<Page>,
+        js: String,
+        budget: std::time::Duration,
+    ) -> Result<Value, String> {
+        self.pick().eval_with_budget(page, js, budget).await
+    }
+
+    async fn eval_with_nav(
+        &self,
+        page: Option<Page>,
+        js: String,
+        budget: std::time::Duration,
+    ) -> (Result<Value, String>, Option<String>) {
+        self.pick().eval_with_nav(page, js, budget).await
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     tabs: Arc<Mutex<HashMap<String, Tab>>>,
     client: Arc<Mutex<NetClient>>,
-    js: JsActor,
+    js: JsPool,
     /// The session's network log (firing 32): document hops are recorded by
     /// the goto/fetch verbs, page-context fetch/XHR hops by the JS bridge.
     /// Returned (and optionally drained) by the `network_log` verb.
@@ -137,6 +410,45 @@ pub struct Engine {
     ws_conns: Arc<Mutex<HashMap<String, se_net::ws::WsConn>>>,
     /// Monotonic source of `ws-N` ids for `ws_connect`.
     ws_next: Arc<std::sync::atomic::AtomicU64>,
+    /// Last use and in-flight count per tab, for the idle sweep.
+    tab_use: Arc<Mutex<TabUse>>,
+}
+
+/// Tab bookkeeping for the sweep: a tab nobody closed (a caller that died, a
+/// loop that names a fresh tab per page) used to stay for the life of the
+/// process, holding its document text and storage.
+#[derive(Default)]
+struct TabUse {
+    last: HashMap<String, (std::time::Instant, u32)>,
+    swept: u64,
+}
+
+/// `SE_WS_IDLE_S` (default 1800, 0 = never) and `SE_WS_MAX` (default 32,
+/// 0 = unbounded) for the agent's WebSocket pool.
+fn ws_limits() -> (Option<std::time::Duration>, usize) {
+    static L: std::sync::OnceLock<(Option<std::time::Duration>, usize)> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+        let idle = num("SE_WS_IDLE_S", 1800);
+        (
+            (idle > 0).then(|| std::time::Duration::from_secs(idle)),
+            num("SE_WS_MAX", 32) as usize,
+        )
+    })
+}
+
+/// `SE_TAB_IDLE_S` (default 1800, 0 = never) and `SE_TAB_MAX` (default 64,
+/// 0 = unbounded).
+fn tab_limits() -> (Option<std::time::Duration>, usize) {
+    static L: std::sync::OnceLock<(Option<std::time::Duration>, usize)> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+        let idle = num("SE_TAB_IDLE_S", 1800);
+        (
+            (idle > 0).then(|| std::time::Duration::from_secs(idle)),
+            num("SE_TAB_MAX", 64) as usize,
+        )
+    })
 }
 
 impl Default for Engine {
@@ -146,17 +458,82 @@ impl Default for Engine {
         Self {
             tabs: Arc::new(Mutex::new(HashMap::new())),
             client: Arc::new(Mutex::new(NetClient::new(se_js::bridge::USER_AGENT))),
-            js: JsActor::default(),
+            js: JsPool::default(),
             net_log: Arc::new(se_net::NetLog::default()),
             session_file: None,
             local_pool: Arc::new(Mutex::new(HashMap::new())),
             ws_conns: Arc::new(Mutex::new(HashMap::new())),
             ws_next: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            tab_use: Arc::new(Mutex::new(TabUse::default())),
         }
     }
 }
 
 impl Engine {
+    /// Drop agent sockets idle past `idle`; returns how many remain. A socket
+    /// inside a verb is out of the map and so is never dropped here.
+    fn sweep_ws(&self, idle: Option<std::time::Duration>) -> usize {
+        let mut conns = self.ws_conns.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(idle) = idle {
+            conns.retain(|_, c| c.idle() < idle);
+        }
+        conns.len()
+    }
+
+    /// Mark a tab used; `delta` moves its in-flight count.
+    fn tab_touch(&self, tab_id: &str, delta: i32) {
+        let mut u = self.tab_use.lock().unwrap_or_else(|e| e.into_inner());
+        let e = u.last.entry(tab_id.to_string()).or_insert((std::time::Instant::now(), 0));
+        e.0 = std::time::Instant::now();
+        e.1 = if delta >= 0 { e.1.saturating_add(delta as u32) } else { e.1.saturating_sub((-delta) as u32) };
+    }
+
+    /// Drop tabs idle past `idle`, then the least recently used ones beyond
+    /// `cap`. A tab with a request in flight is never dropped. Returns how
+    /// many went. Lock order: tabs, then tab_use.
+    fn sweep_tabs(&self, idle: Option<std::time::Duration>, cap: usize) -> usize {
+        let now = std::time::Instant::now();
+        let mut tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut u = self.tab_use.lock().unwrap_or_else(|e| e.into_inner());
+        // A tab first seen here (created by a verb that just ran) starts its
+        // clock now; a record whose tab is gone and idle is dropped.
+        for id in tabs.keys() {
+            u.last.entry(id.clone()).or_insert((now, 0));
+        }
+        u.last.retain(|id, (_, busy)| *busy > 0 || tabs.contains_key(id));
+        let mut gone: Vec<String> = Vec::new();
+        if let Some(idle) = idle {
+            for (id, (at, busy)) in u.last.iter() {
+                if *busy == 0 && tabs.contains_key(id) && now.duration_since(*at) >= idle {
+                    gone.push(id.clone());
+                }
+            }
+        }
+        for id in &gone {
+            tabs.remove(id);
+            u.last.remove(id);
+        }
+        if cap > 0 && tabs.len() > cap {
+            let mut by_age: Vec<(std::time::Instant, String)> = u
+                .last
+                .iter()
+                .filter(|(id, (_, busy))| *busy == 0 && tabs.contains_key(*id))
+                .map(|(id, (at, _))| (*at, id.clone()))
+                .collect();
+            by_age.sort();
+            for (_, id) in by_age {
+                if tabs.len() <= cap {
+                    break;
+                }
+                tabs.remove(&id);
+                u.last.remove(&id);
+                gone.push(id);
+            }
+        }
+        u.swept += gone.len() as u64;
+        gone.len()
+    }
+
     /// Builder: set the default on-disk session file (the `--session-file`
     /// CLI path). Returns self so `Engine::default().with_session_file(p)`
     /// composes at the call site.
@@ -172,8 +549,7 @@ impl Engine {
     /// the reverse.
     fn local_storage_for(&self, origin: &str) -> se_js::bridge::Storage {
         self.local_pool
-            .lock()
-            .expect("local pool lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .entry(origin.to_string())
             .or_default()
             .clone()
@@ -201,6 +577,7 @@ impl Engine {
         loop {
             let (mut pass, nav) = self.render_pass(tab_id, budget).await;
             total.scripts += pass.scripts;
+            total.page_errors.append(&mut pass.page_errors);
             total.skipped += pass.skipped;
             total.errors.append(&mut pass.errors);
             total.errors_total += pass.errors_total;
@@ -208,8 +585,7 @@ impl Engine {
             let Some(target) = nav else { break };
             let current = self
                 .tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .get(tab_id)
                 .map(|t| t.url.clone());
             let Some(current) = current else { break }; // tab vanished mid-render
@@ -224,7 +600,7 @@ impl Engine {
             }
             // A followed navigation: the document whose script navigated is
             // the initiator (wire Referer + Sec-Fetch-Site, document.referrer).
-            let client = self.client.lock().expect("client lock").clone();
+            let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let hop_started = std::time::Instant::now();
             let resp = match client.navigate(&target, Some(&current)).await {
                 Ok(r) => r,
@@ -241,7 +617,7 @@ impl Engine {
             self.net_log
                 .record("document", "GET", &target, resp.status, hop_started.elapsed());
             let tab = {
-                let tabs = self.tabs.lock().expect("tabs lock");
+                let tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 Tab::after_navigation(
                     tabs.get(tab_id),
                     &resp.final_url,
@@ -250,8 +626,7 @@ impl Engine {
                 )
             };
             self.tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .insert(tab_id.to_string(), tab);
             total.final_url = Some(resp.final_url);
             total.final_status = Some(resp.status);
@@ -282,11 +657,10 @@ impl Engine {
     ) -> (RenderStats, Option<String>) {
         let started = std::time::Instant::now();
         let mut stats = RenderStats::default();
-        let cookie_store = Some(self.client.lock().expect("client lock").store());
+        let cookie_store = Some(self.client.lock().unwrap_or_else(|e| e.into_inner()).store());
         let page = self
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .get(tab_id)
             .map(|tab| Page {
                 url: tab.url.clone(),
@@ -306,7 +680,8 @@ impl Engine {
             return (stats, None);
         };
         let writeback = page.writeback.clone();
-        let (units, skips) = collect_scripts(&page.html, &page.url);
+        let want_modules = JS_OPTS.try_with(|o| o.modules && o.prelude).unwrap_or(false);
+        let (units, unit_modules, skips) = collect_scripts_ext(&page.html, &page.url, want_modules);
         stats.skipped += skips.len();
         stats.errors.extend(skips);
         // Fetch externals through the session client (outside every lock),
@@ -314,35 +689,97 @@ impl Engine {
         // subresource-shaped (fetch/XHR Sec-Fetch headers) — close enough
         // for v1; a Script DataKind would be the fidelity upgrade.
         let mut sources: Vec<String> = Vec::new();
+        // Parallel to `sources`: the URL of an external script, None inline.
+        let mut source_keys: Vec<Option<String>> = Vec::new();
+        // Parallel to `sources`: is this one a module script?
+        let mut source_modules: Vec<bool> = Vec::new();
         let mut externals = 0usize;
-        let client = self.client.lock().expect("client lock").clone();
-        for unit in units {
+        let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let pipeline = JS_OPTS.try_with(|o| o.pipeline).unwrap_or(false);
+        let (max_ext, max_bytes) = if pipeline {
+            (PIPELINE_MAX_EXTERNALS, PIPELINE_MAX_SCRIPT_BYTES)
+        } else {
+            (RENDER_MAX_EXTERNALS, RENDER_MAX_SCRIPT_BYTES)
+        };
+        type Fetched = (Result<se_net::Response, String>, std::time::Duration);
+        // Pipeline: every eligible external starts NOW; the loop below awaits
+        // them in document order, so execution order is unchanged while the
+        // waits overlap. One slot per external unit (None = not fetched).
+        let mut started_fetches: std::collections::VecDeque<Option<tokio::task::JoinHandle<Fetched>>> =
+            std::collections::VecDeque::new();
+        if pipeline {
+            let mut n = 0usize;
+            for unit in &units {
+                let ScriptUnit::External(u) = unit else { continue };
+                if noncontent_script(u) {
+                    started_fetches.push_back(None);
+                    continue;
+                }
+                n += 1;
+                if n > max_ext {
+                    started_fetches.push_back(None);
+                    continue;
+                }
+                let (c, u2, from) = (client.clone(), u.clone(), page.url.clone());
+                started_fetches.push_back(Some(tokio::spawn(async move {
+                    let t = std::time::Instant::now();
+                    let r = c
+                        .request_data(&u2, "GET", &[], "", Some(&from), se_net::DataKind::Data)
+                        .await
+                        .map_err(|e| e.to_string());
+                    (r, t.elapsed())
+                })));
+            }
+        }
+        let mut total_bytes = 0usize;
+        for (unit, is_module) in units.into_iter().zip(unit_modules) {
             match unit {
-                ScriptUnit::Inline(src) => sources.push(src),
+                ScriptUnit::Inline(src) => {
+                    sources.push(src);
+                    source_keys.push(None);
+                    source_modules.push(is_module);
+                }
                 ScriptUnit::External(u) => {
+                    let handle = if pipeline { started_fetches.pop_front().flatten() } else { None };
+                    if pipeline && noncontent_script(&u) {
+                        stats.skipped += 1;
+                        stats.errors.push(format!("script skipped: non-content host {u}"));
+                        continue;
+                    }
                     externals += 1;
-                    if externals > RENDER_MAX_EXTERNALS {
+                    if externals > max_ext {
                         stats.skipped += 1;
                         stats
                             .errors
-                            .push(format!("script skipped: external cap {RENDER_MAX_EXTERNALS}"));
+                            .push(format!("script skipped: external cap {max_ext}"));
                         continue;
                     }
-                    let hop_started = std::time::Instant::now();
-                    let got = client
-                        .request_data(&u, "GET", &[], "", Some(&page.url), se_net::DataKind::Data)
-                        .await;
+                    let (got, took): Fetched = match handle {
+                        Some(h) => h
+                            .await
+                            .unwrap_or_else(|e| (Err(format!("fetch task: {e}")), Default::default())),
+                        None => {
+                            let t = std::time::Instant::now();
+                            let r = client
+                                .request_data(&u, "GET", &[], "", Some(&page.url), se_net::DataKind::Data)
+                                .await
+                                .map_err(|e| e.to_string());
+                            (r, t.elapsed())
+                        }
+                    };
                     match got {
                         Ok(resp) if (200..300).contains(&resp.status)
-                            && resp.body.len() <= RENDER_MAX_SCRIPT_BYTES =>
+                            && resp.body.len() <= max_bytes
+                            && (!pipeline || total_bytes + resp.body.len() <= PIPELINE_MAX_TOTAL_BYTES) =>
                         {
-                            self.net_log
-                                .record("fetch", "GET", &u, resp.status, hop_started.elapsed());
+                            self.net_log.record("fetch", "GET", &u, resp.status, took);
+                            total_bytes += resp.body.len();
                             sources.push(resp.body);
+                            source_keys.push(Some(u.clone()));
+                            source_modules.push(is_module);
                         }
                         Ok(resp) => {
-                            self.net_log
-                                .record("fetch", "GET", &u, resp.status, hop_started.elapsed());
+                            self.net_log.record("fetch", "GET", &u, resp.status, took);
                             stats.skipped += 1;
                             stats.errors.push(format!(
                                 "script skipped: {} -> {} ({} bytes)",
@@ -367,10 +804,35 @@ impl Engine {
         }
         let n_sources = sources.len();
         let encoded = serde_json::to_string(&sources).unwrap_or_else(|_| "[]".to_string());
-        let (result, nav) = self
-            .js
-            .eval_with_nav(Some(page), render_harness(&encoded), budget)
-            .await;
+        let prelude = JS_OPTS.try_with(|o| o.prelude).unwrap_or(false);
+        let live = prelude && JS_OPTS.try_with(|o| o.live_dom).unwrap_or(false);
+        let code_cache = prelude && JS_OPTS.try_with(|o| o.code_cache).unwrap_or(false);
+        let harness = if prelude && (live || want_modules || code_cache) {
+            render_harness_full(
+                &encoded,
+                &serde_json::to_string(&source_keys).unwrap_or_else(|_| "[]".to_string()),
+                &serde_json::to_string(&source_modules).unwrap_or_else(|_| "[]".to_string()),
+                live,
+                code_cache,
+            )
+        } else {
+            render_harness_live(&encoded, prelude, None)
+        };
+        let (result, nav) = self.js.eval_with_nav(Some(page), harness, budget).await;
+        // With the prelude the harness answers {errors, page_errors}.
+        let result = match result {
+            Ok(Value::Object(mut o)) => {
+                if let Some(Value::Array(pe)) = o.remove("page_errors") {
+                    stats.page_errors = pe
+                        .into_iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .take(10)
+                        .collect();
+                }
+                Ok(o.remove("errors").unwrap_or(Value::Array(Vec::new())))
+            }
+            other => other,
+        };
         match result {
             Ok(Value::Array(errs)) => {
                 // `scripts` counts scripts that ran clean; each harness-side
@@ -389,9 +851,9 @@ impl Engine {
         // Adopt the DOM-mutation writeback — the same take-and-adopt the
         // eval verb runs: publish only if no navigation replaced the tab
         // while the pump drained (the writeback's `from` is still current).
-        let pending = writeback.lock().expect("writeback lock").take();
+        let pending = writeback.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(wb) = pending {
-            let mut tabs = self.tabs.lock().expect("tabs lock");
+            let mut tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(tab) = tabs.get_mut(tab_id) {
                 if tab.html == wb.from {
                     tab.html = wb.html;
@@ -415,20 +877,20 @@ impl Engine {
     /// lifetime is the top-level browsing context, so Playwright's format —
     /// and any session the artifact reopens into — never persists it.
     fn session_artifact(&self, tab_id: &str) -> Value {
-        let client = self.client.lock().expect("client lock").clone();
+        let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let cookies: Vec<Value> = client
             .store()
             .snapshot()
             .iter()
             .map(cookie_wire)
             .collect();
-        let tabs = self.tabs.lock().expect("tabs lock");
+        let tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner());
         let mut origins: Vec<Value> = Vec::new();
         if tabs.get(tab_id).is_some() {
             // The WHOLE pool exports: Playwright's artifact is per-context,
             // and the pool IS the context — every origin the session touched
             // rides along, not just the ones this tab visited.
-            let pool = self.local_pool.lock().expect("local pool lock");
+            let pool = self.local_pool.lock().unwrap_or_else(|e| e.into_inner());
             let mut sources: Vec<(String, &se_js::bridge::Storage)> =
                 pool.iter().map(|(o, s)| (o.clone(), s)).collect();
             sources.sort_by(|a, b| a.0.cmp(&b.0));
@@ -507,7 +969,7 @@ impl Engine {
         }
         // Inject into the LIVE jar: the next fetch/goto carries the
         // session, which is the point of the verb.
-        let client = self.client.lock().expect("client lock").clone();
+        let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut loaded = 0usize;
         for e in &entries {
             if client.store().insert_entry(e) {
@@ -520,7 +982,7 @@ impl Engine {
         // per-profile semantics). Session storage is never restored — its
         // lifetime is the browsing context, not the session.
         {
-            let mut tabs = self.tabs.lock().expect("tabs lock");
+            let mut tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner());
             tabs.entry(tab_id.to_string()).or_insert_with(|| Tab {
                 url: String::new(),
                 referrer: String::new(),
@@ -531,7 +993,7 @@ impl Engine {
                 writeback: Default::default(),
             });
         }
-        let mut pool = self.local_pool.lock().expect("local pool lock");
+        let mut pool = self.local_pool.lock().unwrap_or_else(|e| e.into_inner());
         for origin_state in state
             .get("origins")
             .and_then(Value::as_array)
@@ -875,6 +1337,326 @@ fn tab_id_of(params: &Value) -> &str {
 /// Bare words like "captcha" are unusable — Facebook's normal pages name
 /// `arkose_captcha` in a resource-loader list — so signatures must mark a
 /// *presented* challenge, not a mentioned one.
+/// `detect_bot` with the signatures tied to where they mean something
+/// (`bot_scoped: true` on goto/fetch). The bare-substring form flags any
+/// page that MENTIONS a vendor: an article about Arkose, a forum post
+/// quoting `/login/checkpoint`, a JSON API with a null `feed_units`. Scoped:
+/// the two Facebook signatures count on Facebook hosts only, and a vendor
+/// name counts only inside a tag (a script/iframe/form attribute), not in
+/// prose or in a script's text.
+pub fn detect_bot_scoped(body: &str, url: &str) -> Option<&'static str> {
+    fn in_tag(body: &str, sig: &str) -> bool {
+        let mut from = 0;
+        while let Some(i) = body[from..].find(sig) {
+            let at = from + i;
+            let head = &body[..at];
+            if let Some(lt) = head.rfind('<') {
+                let open = &head[lt..];
+                let is_text_tag = open.len() > 1
+                    && open.as_bytes()[1].is_ascii_alphabetic()
+                    && !open.contains('>');
+                if is_text_tag {
+                    return true;
+                }
+            }
+            from = at + sig.len();
+        }
+        false
+    }
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let facebook = ["facebook.com", "fb.com", "messenger.com", "instagram.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+    if in_tag(body, "px-captcha") {
+        return Some("perimeterx_challenge");
+    }
+    if in_tag(body, "arkoselabs.com") {
+        return Some("arkose_enforcement");
+    }
+    if facebook {
+        if body.contains("/login/checkpoint") {
+            return Some("login_checkpoint");
+        }
+        if body.contains("feed_units\":null") {
+            return Some("empty_feed_units");
+        }
+    }
+    None
+}
+
+fn bot_verdict(body: &str, url: &str, params: &Value) -> Option<&'static str> {
+    if bool_param(params, "bot_scoped") {
+        detect_bot_scoped(body, url)
+    } else {
+        detect_bot(body)
+    }
+}
+
+/// `timeout_ms` on goto/fetch: ONE deadline for the whole verb (every
+/// redirect hop and the body read), so the caller's budget is the engine's
+/// budget. Absent = the client's own timeouts, as before.
+fn deadline_param(params: &Value) -> Option<std::time::Duration> {
+    let ms = params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| param(params, "timeout_ms").and_then(|s| s.parse().ok()))?;
+    Some(std::time::Duration::from_millis(ms.clamp(100, 300_000)))
+}
+
+/// Run a CPU-bound read (an HTML parse, a snapshot walk) without holding a
+/// runtime worker: the worker's queued tasks -- other connections' requests
+/// -- move to another thread instead of waiting for the parse to end.
+fn off_worker<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+/// A tab's URL and document, copied out under the lock (the lock is not
+/// held while the caller parses).
+fn tab_document(engine: &Engine, params: &Value) -> Option<(String, String)> {
+    let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
+    let tab = tabs.get(tab_id_of(params))?;
+    Some((tab.url.clone(), tab.html.clone()))
+}
+
+/// Snapshot shaping options (`read_snapshot` and `read`), all opt-in:
+/// `dedupe` drops an entry that only repeats its listed ancestor's text,
+/// `absolute` resolves `href` against the document base, `max_entries` and
+/// `max_text` cap the list and each entry's text.
+#[derive(Clone, Copy, Default)]
+struct SnapShape {
+    dedupe: bool,
+    absolute: bool,
+    max_entries: usize,
+    max_text: usize,
+}
+
+impl SnapShape {
+    fn from_params(params: &Value) -> Self {
+        let num = |k: &str| params.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+        Self {
+            dedupe: bool_param(params, "dedupe"),
+            absolute: bool_param(params, "absolute"),
+            max_entries: num("max_entries"),
+            max_text: num("max_text"),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.dedupe || self.absolute || self.max_entries > 0 || self.max_text > 0
+    }
+
+    /// Shape `entries` and write `snapshot` (+ the counts when shaping ran).
+    fn apply(
+        &self,
+        mut entries: Vec<se_dom::snapshot::SnapEntry>,
+        page_url: &str,
+        doc: &Document,
+        out: &mut Value,
+    ) {
+        if !self.any() {
+            out["snapshot"] = json!(entries);
+            return;
+        }
+        let total = entries.len();
+        if self.dedupe {
+            entries = dedupe_snapshot(entries);
+        }
+        let deduped = total - entries.len();
+        if self.absolute {
+            if let Some(base) = document_base(doc, page_url) {
+                for e in entries.iter_mut() {
+                    if let Some(h) = e.href.as_deref() {
+                        let h = h.trim();
+                        if h.is_empty() || h.starts_with('#') || h.starts_with("javascript:") {
+                            continue;
+                        }
+                        if let Ok(abs) = base.join(h) {
+                            e.href = Some(abs.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if self.max_text > 0 {
+            for e in entries.iter_mut() {
+                if e.text.chars().count() > self.max_text {
+                    let mut cut: String = e.text.chars().take(self.max_text).collect();
+                    cut.push('\u{2026}');
+                    e.text = cut;
+                }
+            }
+        }
+        let truncated = self.max_entries > 0 && entries.len() > self.max_entries;
+        if truncated {
+            entries.truncate(self.max_entries);
+        }
+        out["snapshot"] = json!(entries);
+        out["snapshot_total"] = json!(total);
+        out["snapshot_deduped"] = json!(deduped);
+        out["snapshot_truncated"] = json!(truncated);
+    }
+}
+
+/// What relative URLs in the document resolve against: `<base href>` wins
+/// over the page URL, as in a browser.
+fn document_base(doc: &Document, page_url: &str) -> Option<url::Url> {
+    let page = url::Url::parse(page_url).ok();
+    doc.select_one("base[href]")
+        .ok()
+        .flatten()
+        .and_then(|b| b.attr("href").map(str::to_string))
+        .and_then(|h| page.as_ref()?.join(&h).ok())
+        .or(page)
+}
+
+/// Drop entries that carry nothing their listed ancestor does not already
+/// say: a non-interactive element with no identity attribute whose text is
+/// part of a textual ancestor's text (`<p>Hello <b>world</b></p>` lists the
+/// `p`; `<a><span>Buy</span></a>` lists the `a`). Depths are left as they
+/// were, so the surviving entries still nest correctly.
+fn dedupe_snapshot(entries: Vec<se_dom::snapshot::SnapEntry>) -> Vec<se_dom::snapshot::SnapEntry> {
+    let mut out: Vec<se_dom::snapshot::SnapEntry> = Vec::with_capacity(entries.len());
+    // (depth, text) of the listed ancestors that carry text.
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for e in entries {
+        while stack.last().is_some_and(|(d, _)| *d >= e.depth) {
+            stack.pop();
+        }
+        let plain = !e.interactive
+            && e.id.is_none()
+            && e.href.is_none()
+            && e.alt.is_none()
+            && e.name.is_none()
+            && e.aria_label.is_none()
+            && e.control_type.is_none();
+        let repeats = plain
+            && !e.text.is_empty()
+            && stack.iter().any(|(_, t)| t.contains(e.text.as_str()));
+        if !e.text.is_empty() {
+            stack.push((e.depth, e.text.clone()));
+        }
+        if !repeats {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// The `read` verb's body: `include` picks any of "html", "text",
+/// "snapshot", "links"; `selector` scopes all of them to the first match.
+fn read_combined(params: &Value, url: &str, html: String) -> Value {
+    let include: Vec<String> = match params.get("include") {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::String(s)) => s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect(),
+        _ => vec!["text".to_string()],
+    };
+    for part in &include {
+        if !matches!(part.as_str(), "html" | "text" | "snapshot" | "links") {
+            return verb_error(format!("read: unknown include {part:?}"));
+        }
+    }
+    let wants = |k: &str| include.iter().any(|p| p == k);
+    let selector = param(params, "selector").filter(|s| !s.is_empty());
+    let mut out = json!({"ok": true, "tab_id": tab_id_of(params), "url": url});
+    if selector.is_none() && include.iter().all(|p| p == "html") {
+        // The whole document and nothing else: no parse at all.
+        out["html"] = json!(html);
+        return out;
+    }
+    let doc = Document::parse(&html);
+    let scope = match selector {
+        Some(sel) => match doc.select_one(sel) {
+            Ok(Some(n)) => Some(n),
+            Ok(None) => return verb_error(format!("read: no match {sel:?}")),
+            Err(e) => return verb_error(format!("read: {e}")),
+        },
+        None => None,
+    };
+    if wants("text") {
+        let target = match scope {
+            Some(n) => Some(n),
+            None => doc.select_one("body").ok().flatten().or_else(|| doc.root()),
+        };
+        out["text"] = json!(target.map(|n| n.inner_text()).unwrap_or_default());
+    }
+    if wants("snapshot") || wants("links") {
+        let entries = se_dom::snapshot::snapshot(&doc, scope);
+        if wants("links") {
+            // Document order, one row per target: what an agent follows next.
+            let base = document_base(&doc, url);
+            let mut seen = std::collections::HashSet::new();
+            let mut links = Vec::new();
+            for e in entries.iter().filter(|e| e.kind == "a") {
+                let Some(h) = e.href.as_deref().map(str::trim) else { continue };
+                if h.is_empty() || h.starts_with('#') || h.starts_with("javascript:") {
+                    continue;
+                }
+                let abs = base
+                    .as_ref()
+                    .and_then(|b| b.join(h).ok())
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| h.to_string());
+                if seen.insert(abs.clone()) {
+                    let label = if e.text.is_empty() { e.aria_label.clone().unwrap_or_default() } else { e.text.clone() };
+                    links.push(json!({"href": abs, "text": label}));
+                }
+            }
+            out["links"] = json!(links);
+        }
+        if wants("snapshot") {
+            SnapShape::from_params(params).apply(entries, url, &doc, &mut out);
+        }
+    }
+    if wants("html") {
+        out["html"] = match scope {
+            Some(n) => json!(n.html()),
+            None => json!(html),
+        };
+    }
+    out
+}
+
+fn js_opts_param(params: &Value) -> JsOpts {
+    let quiesce = params
+        .get("quiesce")
+        .and_then(Value::as_u64)
+        .map(|n| n.min(1000) as u32)
+        .unwrap_or(0);
+    JsOpts {
+        quiesce,
+        page_referer: bool_param(params, "page_referer"),
+        prelude: bool_param(params, "prelude"),
+        pipeline: bool_param(params, "script_pipeline"),
+        live_dom: bool_param(params, "live_dom"),
+        fetch_pool: bool_param(params, "fetch_pool"),
+        modules: bool_param(params, "modules"),
+        quiet_ms: params.get("quiet_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(10_000),
+        code_cache: bool_param(params, "code_cache"),
+    }
+}
+
+/// A body the caller cannot use as text: not a text/markup/JSON content
+/// type, or PDF magic whatever the header says.
+fn is_binary_body(content_type: &str, bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"%PDF-") {
+        return true;
+    }
+    let ct = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if ct.is_empty() || ct.starts_with("text/") {
+        return false;
+    }
+    !(ct.contains("json") || ct.contains("xml") || ct.contains("html")
+        || ct.contains("javascript") || ct.contains("x-www-form-urlencoded"))
+}
+
 pub fn detect_bot(body: &str) -> Option<&'static str> {
     for (sig, reason) in [
         ("px-captcha", "perimeterx_challenge"),
@@ -917,6 +1699,9 @@ const RENDER_NAV_MAX_HOPS: usize = 10;
 /// the caller sees where the render actually landed.
 #[derive(Default)]
 struct RenderStats {
+    /// What the page reported about itself during the pass (console.error,
+    /// handler exceptions): `page_errors` in the envelope. Prelude renders only.
+    page_errors: Vec<String>,
     scripts: usize,
     skipped: usize,
     errors: Vec<String>,
@@ -998,18 +1783,48 @@ fn script_kind(type_attr: Option<&str>) -> Result<(), &'static str> {
 /// browsers execute JS-mime data-URI scripts, and Comet-class pages (FB's
 /// marketplace among them) boot partly from data chunks; before this they
 /// fell into the unresolvable skip and hydration never completed.
+#[cfg_attr(not(test), allow(dead_code))]
 fn collect_scripts(html: &str, base_url: &str) -> (Vec<ScriptUnit>, Vec<String>) {
+    let (units, _, skips) = collect_scripts_ext(html, base_url, false);
+    (units, skips)
+}
+
+/// `collect_scripts` that can keep module scripts: with `modules` on, a
+/// `type="module"` script is a unit (flagged in the parallel vector) and a
+/// `nomodule` fallback is skipped, as in a browser that runs modules.
+fn collect_scripts_ext(
+    html: &str,
+    base_url: &str,
+    modules: bool,
+) -> (Vec<ScriptUnit>, Vec<bool>, Vec<String>) {
     let mut units = Vec::new();
+    let mut flags = Vec::new();
     let mut skips = Vec::new();
     let parsed = Document::parse(html);
     let Ok(doc) = parsed.select("script") else {
-        return (units, skips);
+        return (units, flags, skips);
     };
+    // The flag of the unit the previous node produced (a node may `continue`
+    // out of the match below after pushing its unit).
+    let mut last_module = false;
     for node in doc {
-        if let Err(why) = script_kind(node.attr("type")) {
-            skips.push(format!("script skipped: {why}"));
-            continue;
+        flags.resize(units.len(), last_module);
+        let is_module = modules
+            && node
+                .attr("type")
+                .map(|t| t.trim().eq_ignore_ascii_case("module"))
+                .unwrap_or(false);
+        if !is_module {
+            if let Err(why) = script_kind(node.attr("type")) {
+                skips.push(format!("script skipped: {why}"));
+                continue;
+            }
+            if modules && node.attr("nomodule").is_some() {
+                skips.push("script skipped: nomodule fallback".to_string());
+                continue;
+            }
         }
+        last_module = is_module;
         match node.attr("src") {
             Some(src) if !src.trim().is_empty() => {
                 let src = src.trim();
@@ -1037,7 +1852,8 @@ fn collect_scripts(html: &str, base_url: &str) -> (Vec<ScriptUnit>, Vec<String>)
             _ => units.push(ScriptUnit::Inline(node.text())),
         }
     }
-    (units, skips)
+    flags.resize(units.len(), last_module);
+    (units, flags, skips)
 }
 
 /// Executable JS mimes for `data:`-URI script srcs — the `script_kind`
@@ -1144,7 +1960,142 @@ fn percent_decode(bytes: &[u8]) -> Option<Vec<u8>> {
 /// "complete", so gating scripts register but never run without this;
 /// bubbles:true carries it to window listeners (event_phases' bubble leg).
 /// Completion value: the error array, which lands in `render_errors`.
-fn render_harness(encoded_sources: &str) -> String {
+#[allow(dead_code)]
+fn render_harness(encoded_sources: &str, prelude: bool) -> String {
+    render_harness_live(encoded_sources, prelude, None)
+}
+
+/// `render_harness` with the live DOM: `keys` is a JSON array parallel to the
+/// sources (the external script's URL, or null for an inline one), so each
+/// script runs with `document.currentScript` and a `document.write` position.
+fn render_harness_live(encoded_sources: &str, prelude: bool, keys: Option<&str>) -> String {
+    if let (true, Some(keys)) = (prelude, keys) {
+        let mods = "[]";
+        return render_harness_full(encoded_sources, keys, mods, true, false);
+    }
+    render_harness_plain(encoded_sources, prelude)
+}
+
+/// The prelude harness with every optional piece: the live DOM (`live`),
+/// module scripts (`mods`: a JSON array of booleans parallel to the sources;
+/// modules run after the classic scripts, in order, before DOMContentLoaded,
+/// as deferred scripts do) and the cached classic-script runner (`cache`).
+fn render_harness_full(
+    encoded_sources: &str,
+    keys: &str,
+    mods: &str,
+    live: bool,
+    cache: bool,
+) -> String {
+    {
+        let live_boot = if live {
+            format!(
+                r#"try {{ if (typeof __seRunScript === "function") {{ __seRunScript({live_src}, "se:livedom"); }} else {{ (0, eval)({live_src}); }} }} catch (__el) {{ (globalThis.__sePageErrors = globalThis.__sePageErrors || []).push("livedom: " + (__el && __el.stack || __el)); }}"#,
+                live_src = serde_json::to_string(LIVEDOM_JS).unwrap_or_else(|_| "\"\"".to_string()),
+            )
+        } else {
+            String::new()
+        };
+        return format!(
+            r#"var __seRE = [];
+try {{ if (typeof __seRunScript === "function") {{ __seRunScript({prelude_src}, "se:prelude"); }} else {{ (0, eval)({prelude_src}); }} }} catch (__ep) {{ globalThis.__sePageErrors = ["prelude: " + __ep]; }}
+{live_boot}
+var __seSS = {encoded_sources};
+var __seSK = {keys};
+var __seSM = {mods};
+var __seCC = {cache} && typeof __seRunScript === "function";
+var __seLV = globalThis.__seLive;
+var __seMQ = [];
+for (var __sei = 0; __sei < __seSS.length; __sei++) {{
+  var __s = __seSS[__sei];
+  if (__seSM[__sei]) {{ __seMQ.push(__sei); continue; }}
+  if (__seCC) {{
+    if (__seLV) {{ try {{ __seLV.enter(__s, __seSK[__sei]); }} catch (__e5) {{}} }}
+    try {{ __seRunScript(__s, __seSK[__sei] || null); }} catch (__e2) {{
+      __seRE.push((__e2 instanceof SyntaxError ? "compile script " : "run script ") + __sei + ": " + __e2);
+    }}
+    if (__seLV) {{ try {{ __seLV.leave(); }} catch (__e6) {{}} }}
+    continue;
+  }}
+  try {{ new Function(__s); }} catch (__e) {{
+    __seRE.push("compile script " + __sei + ": " + __e); continue;
+  }}
+  if (__seLV) {{ try {{ __seLV.enter(__s, __seSK[__sei]); }} catch (__e5) {{}} }}
+  try {{ (0, eval)(__s); }} catch (__e2) {{
+    __seRE.push("run script " + __sei + ": " + __e2);
+  }}
+  if (__seLV) {{ try {{ __seLV.leave(); }} catch (__e6) {{}} }}
+}}
+for (var __seq = 0; __seq < __seMQ.length; __seq++) {{
+  var __mi = __seMQ[__seq];
+  try {{
+    var __mp = __seRunModule(__seSS[__mi], __seSK[__mi] || null);
+    if (__mp && typeof __mp.then === "function") {{
+      __mp.then(null, function (__me) {{
+        (globalThis.__sePageErrors = globalThis.__sePageErrors || []).push("module: " + (__me && __me.message || __me));
+      }});
+    }}
+  }} catch (__e7) {{
+    __seRE.push("run module " + __mi + ": " + (__e7 && __e7.message || __e7));
+  }}
+}}
+try {{
+  document.dispatchEvent({{ type: "DOMContentLoaded", bubbles: true }});
+}} catch (__e3) {{ __seRE.push("dispatch: " + __e3); }}
+try {{
+  if (typeof window.onload === "function") {{
+    var __o = window.onload, __c = 0;
+    window.onload = function (e) {{ __c++; return __o.call(this, e); }};
+    window.dispatchEvent({{ type: "load" }});
+    if (!__c) {{ window.onload({{ type: "load", target: window }}); }}
+    window.onload = __o;
+  }} else {{
+    window.dispatchEvent({{ type: "load" }});
+  }}
+}} catch (__e4) {{ (globalThis.__sePageErrors = globalThis.__sePageErrors || []).push("load: " + __e4); }}
+({{ errors: __seRE, page_errors: (globalThis.__sePageErrors || []).slice(0, 10) }});"#,
+            prelude_src = serde_json::to_string(PRELUDE_JS).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+    }
+}
+
+fn render_harness_plain(encoded_sources: &str, prelude: bool) -> String {
+    if prelude {
+        // Same script loop, between the globals prelude and the lifecycle a
+        // browser runs after parsing: DOMContentLoaded, then `load` on window
+        // (listeners and a bare `window.onload`, once each). Pages that start
+        // from `load` never started before this.
+        return format!(
+            r#"var __seRE = [];
+try {{ if (typeof __seRunScript === "function") {{ __seRunScript({prelude_src}, "se:prelude"); }} else {{ (0, eval)({prelude_src}); }} }} catch (__ep) {{ globalThis.__sePageErrors = ["prelude: " + __ep]; }}
+var __seSS = {encoded_sources};
+for (var __sei = 0; __sei < __seSS.length; __sei++) {{
+  var __s = __seSS[__sei];
+  try {{ new Function(__s); }} catch (__e) {{
+    __seRE.push("compile script " + __sei + ": " + __e); continue;
+  }}
+  try {{ (0, eval)(__s); }} catch (__e2) {{
+    __seRE.push("run script " + __sei + ": " + __e2);
+  }}
+}}
+try {{
+  document.dispatchEvent({{ type: "DOMContentLoaded", bubbles: true }});
+}} catch (__e3) {{ __seRE.push("dispatch: " + __e3); }}
+try {{
+  if (typeof window.onload === "function") {{
+    var __o = window.onload, __c = 0;
+    window.onload = function (e) {{ __c++; return __o.call(this, e); }};
+    window.dispatchEvent({{ type: "load" }});
+    if (!__c) {{ window.onload({{ type: "load", target: window }}); }}
+    window.onload = __o;
+  }} else {{
+    window.dispatchEvent({{ type: "load" }});
+  }}
+}} catch (__e4) {{ (globalThis.__sePageErrors = globalThis.__sePageErrors || []).push("load: " + __e4); }}
+({{ errors: __seRE, page_errors: (globalThis.__sePageErrors || []).slice(0, 10) }});"#,
+            prelude_src = serde_json::to_string(PRELUDE_JS).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+    }
     format!(
         r#"var __seRE = [];
 var __seSS = {encoded_sources};
@@ -1177,11 +2128,53 @@ fn dispatch<'a>(
     Box<dyn std::future::Future<Output = Result<Value, (i64, String)>> + Send + 'a>,
 > {
     Box::pin(async move {
+        // Tab bookkeeping around every verb: the tab it names is in use for
+        // the length of the call, and idle tabs are swept on the way in.
+        struct InUse<'e>(&'e Engine, String);
+        impl Drop for InUse<'_> {
+            fn drop(&mut self) {
+                self.0.tab_touch(&self.1, -1);
+            }
+        }
+        let tab = tab_id_of(&params).to_string();
+        engine.tab_touch(&tab, 1);
+        let _in_use = InUse(engine, tab);
+        let (idle, cap) = tab_limits();
+        engine.sweep_tabs(idle, cap);
+        dispatch_inner(engine, method, params).await
+    })
+}
+
+fn dispatch_inner<'a>(
+    engine: &'a Engine,
+    method: &'a str,
+    params: Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Value, (i64, String)>> + Send + 'a>,
+> {
+    Box::pin(async move {
     match method {
         "health" => Ok(json!({
             "ok": true,
             "engine": "searchio-engine",
             "version": env!("CARGO_PKG_VERSION"),
+            "js": engine.js.health(),
+            "code_cache": {
+                "hits": se_js::code_cache_stats().0,
+                "misses": se_js::code_cache_stats().1,
+                "rejected": se_js::code_cache_stats().2,
+                "entries": se_js::code_cache_stats().3,
+                "bytes": se_js::code_cache_stats().4,
+            },
+            "tls_impersonate": {
+                "built": se_net::TLS_IMPERSONATE_BUILT,
+                "on": se_net::tls_impersonate_enabled(),
+            },
+            "tabs": engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "ws": engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "tabs_swept": engine.tab_use.lock().unwrap_or_else(|e| e.into_inner()).swept,
+            "tab_idle_s": tab_limits().0.map(|d| d.as_secs()).unwrap_or(0),
+            "tab_max": tab_limits().1,
         })),
 
         "goto" => {
@@ -1193,12 +2186,24 @@ fn dispatch<'a>(
             // initiator (wire Referer + Sec-Fetch-Site, document.referrer).
             // First load on the tab → None → address-bar presentation.
             let initiator = {
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 tabs.get(tab_id_of(&params)).map(|t| t.url.clone())
             };
-            let client = engine.client.lock().expect("client lock").clone();
+            let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let hop_started = std::time::Instant::now();
-            let resp = match client.navigate(url, initiator.as_deref()).await {
+            let nav = client.navigate(url, initiator.as_deref());
+            let resp = match deadline_param(&params) {
+                Some(d) => match tokio::time::timeout(d, nav).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Ok(verb_error(format!(
+                            "goto: no answer within timeout_ms ({} ms)", d.as_millis()
+                        )))
+                    }
+                },
+                None => nav.await,
+            };
+            let resp = match resp {
                 Ok(r) => r,
                 Err(e) => return Ok(verb_error(format!("goto: {e}"))),
             };
@@ -1213,9 +2218,9 @@ fn dispatch<'a>(
                 resp.status,
                 hop_started.elapsed(),
             );
-            let bot = detect_bot(&resp.body);
+            let bot = bot_verdict(&resp.body, &resp.final_url, &params);
             let tab = {
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 Tab::after_navigation(
                     tabs.get(tab_id_of(&params)),
                     &resp.final_url,
@@ -1225,8 +2230,7 @@ fn dispatch<'a>(
             };
             engine
                 .tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .insert(tab_id_of(&params).to_string(), tab);
             let mut out = json!({
                 "ok": true,
@@ -1238,7 +2242,9 @@ fn dispatch<'a>(
             });
             if bool_param(&params, "render") {
                 let budget = settle_ms_param(&params).unwrap_or(se_js::bridge::TIMER_BUDGET);
-                let stats = engine.render_tab(tab_id_of(&params), budget).await;
+                let stats = JS_OPTS
+                    .scope(js_opts_param(&params), engine.render_tab(tab_id_of(&params), budget))
+                    .await;
                 out["rendered"] = json!(true);
                 out["render_scripts"] = json!(stats.scripts);
                 out["render_skipped"] = json!(stats.skipped);
@@ -1246,6 +2252,9 @@ fn dispatch<'a>(
                 out["render_errors_total"] = json!(stats.errors_total);
                 out["render_ms"] = json!(stats.ms);
                 out["render_nav_hops"] = json!(stats.nav_hops);
+                if !stats.page_errors.is_empty() {
+                    out["page_errors"] = json!(stats.page_errors);
+                }
                 // A page-script navigation follow replaced the document:
                 // the envelope reports where the render actually LANDED.
                 if let (Some(u), Some(s)) = (stats.final_url, stats.final_status) {
@@ -1256,25 +2265,41 @@ fn dispatch<'a>(
             Ok(out)
         }
 
+        "read" => {
+            // One call, one parse: any of html / text / snapshot / links of a
+            // tab (`include`), all from the same document state.
+            let Some((url, html)) = tab_document(engine, &params) else {
+                return Ok(verb_error(format!("read: no tab {:?}", tab_id_of(&params))));
+            };
+            Ok(off_worker(|| read_combined(&params, &url, html)))
+        }
+
         "read_html" => {
-            let tabs = engine.tabs.lock().expect("tabs lock");
-            let Some(tab) = tabs.get(tab_id_of(&params)) else {
+            // The tab lock is held for the copy only: parsing a large page
+            // under it made every other tab's read wait.
+            let Some((_, tab_html)) = tab_document(engine, &params) else {
                 return Ok(verb_error(format!("read_html: no tab {:?}", tab_id_of(&params))));
             };
             let html = match param(&params, "selector") {
                 Some(sel) if !sel.is_empty() => {
-                    let doc = Document::parse(&tab.html);
-                    match doc.select(sel) {
-                        Ok(nodes) => nodes.iter().map(|n| n.html()).collect::<String>(),
+                    let picked = off_worker(|| {
+                        let doc = Document::parse(&tab_html);
+                        doc.select(sel)
+                            .map(|nodes| nodes.iter().map(|n| n.html()).collect::<String>())
+                            .map_err(|e| e.to_string())
+                    });
+                    match picked {
+                        Ok(html) => html,
                         Err(e) => return Ok(verb_error(format!("read_html: {e}"))),
                     }
                 }
-                _ => tab.html.clone(),
+                _ => tab_html,
             };
             Ok(json!({"ok": true, "html": html}))
         }
 
         "read_text" => {
+            off_worker(|| -> Result<Value, (i64, String)> {
             // The protocol's text-extraction verb (Playwright `inner_text`
             // parity): `selector` → first match, else `body`. The engine
             // has no CSSOM, so the se-dom walk is a structural floor —
@@ -1282,14 +2307,13 @@ fn dispatch<'a>(
             // template subtrees are skipped, whitespace collapses.
             // Hidden-element evaluation would need layout; the zero-DOMRect
             // precedent documents that as out of scope by design.
-            let tabs = engine.tabs.lock().expect("tabs lock");
-            let Some(tab) = tabs.get(tab_id_of(&params)) else {
+            let Some((tab_url, tab_html)) = tab_document(engine, &params) else {
                 return Ok(verb_error(format!(
                     "read_text: no tab {:?}",
                     tab_id_of(&params)
                 )));
             };
-            let doc = Document::parse(&tab.html);
+            let doc = Document::parse(&tab_html);
             let target = match param(&params, "selector") {
                 Some(sel) if !sel.is_empty() => match doc.select_one(sel) {
                     Ok(t) => t,
@@ -1304,12 +2328,14 @@ fn dispatch<'a>(
             Ok(json!({
                 "ok": true,
                 "tab_id": tab_id_of(&params),
-                "url": tab.url,
+                "url": tab_url,
                 "text": text,
             }))
+                    })
         }
 
         "read_snapshot" => {
+            off_worker(|| -> Result<Value, (i64, String)> {
             // The agent's structural "eyes" (firing 38): a flat, document-
             // order list of VISIBLE elements — kind, computed role, text,
             // interactivity, and the identity attributes an agent acts on.
@@ -1317,14 +2343,13 @@ fn dispatch<'a>(
             // inline display:none/visibility:hidden/opacity:0, type=hidden,
             // aria-hidden) — hidden subtrees are pruned, not listed. `selector`
             // scopes to the FIRST match's subtree; absent = whole document.
-            let tabs = engine.tabs.lock().expect("tabs lock");
-            let Some(tab) = tabs.get(tab_id_of(&params)) else {
+            let Some((tab_url, tab_html)) = tab_document(engine, &params) else {
                 return Ok(verb_error(format!(
                     "read_snapshot: no tab {:?}",
                     tab_id_of(&params)
                 )));
             };
-            let doc = Document::parse(&tab.html);
+            let doc = Document::parse(&tab_html);
             let scope_node = match param(&params, "selector") {
                 Some(sel) if !sel.is_empty() => match doc.select_one(sel) {
                     Ok(Some(node)) => Some(node),
@@ -1336,12 +2361,16 @@ fn dispatch<'a>(
                 _ => None,
             };
             let entries = se_dom::snapshot::snapshot(&doc, scope_node);
-            Ok(json!({
+            // Shaping is opt-in: without the options the list is as before.
+            let shape = SnapShape::from_params(&params);
+            let mut out = json!({
                 "ok": true,
                 "tab_id": tab_id_of(&params),
-                "url": tab.url,
-                "snapshot": entries,
-            }))
+                "url": tab_url,
+            });
+            shape.apply(entries, &tab_url, &doc, &mut out);
+            Ok(out)
+                    })
         }
 
         "read_image" => {
@@ -1357,7 +2386,7 @@ fn dispatch<'a>(
             // dispatch future's Send) die at this block's close, before any
             // await. Only owned values escape.
             let (base, alt, src) = {
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(tab) = tabs.get(tab_id_of(&params)) else {
                     return Ok(verb_error(format!(
                         "read_image: no tab {:?}",
@@ -1417,7 +2446,7 @@ fn dispatch<'a>(
                     Ok(u) => u.to_string(),
                     Err(_) => return Ok(verb_error(format!("read_image: bad src {src:?}"))),
                 };
-                let client = engine.client.lock().expect("client lock").clone();
+                let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let initiator = Some(base.as_str());
                 let hop_started = std::time::Instant::now();
                 let resp =
@@ -1481,11 +2510,28 @@ fn dispatch<'a>(
                     let Some(vs) = v.as_str() else {
                         return Ok(verb_error(format!("ws_connect: header {k:?} is not a string")));
                     };
+                    // A line break in a name or value would write a second
+                    // header (or a second request) into the handshake.
+                    if k.is_empty()
+                        || k.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7f)
+                        || vs.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+                    {
+                        return Ok(verb_error(format!("ws_connect: header {k:?} is not a valid header")));
+                    }
                     extra.push((k.clone(), vs.to_string()));
                 }
             }
+            // Sockets the agent never closed: drop the idle ones, then refuse
+            // past the cap rather than grow without bound.
+            let (ws_idle, ws_max) = ws_limits();
+            let open = engine.sweep_ws(ws_idle);
+            if ws_max > 0 && open >= ws_max {
+                return Ok(verb_error(format!(
+                    "ws_connect: {open} connections open (limit {ws_max}); close one first"
+                )));
+            }
             let (ua, cookie) = {
-                let client = engine.client.lock().expect("client lock").clone();
+                let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let ua = client.user_agent();
                 // The jar keys on scheme: normalize ws→http / wss→https so
                 // secure-cookie matching sees the TLS flag it expects.
@@ -1504,7 +2550,18 @@ fn dispatch<'a>(
                 cookie,
                 headers: extra,
             };
-            let (conn, resp_headers) = match se_net::ws::connect(url, &ctx).await {
+            let budget = params
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(15_000)
+                .clamp(100, 120_000);
+            let (conn, resp_headers) = match se_net::ws::connect_within(
+                url,
+                &ctx,
+                std::time::Duration::from_millis(budget),
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => return Ok(verb_error(format!("ws_connect: {e}"))),
             };
@@ -1514,8 +2571,7 @@ fn dispatch<'a>(
             let ws_id = format!("ws-{id_n}");
             engine
                 .ws_conns
-                .lock()
-                .expect("ws conns lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .insert(ws_id.clone(), conn);
             let headers_obj: serde_json::Map<String, Value> = resp_headers
                 .into_iter()
@@ -1548,7 +2604,7 @@ fn dispatch<'a>(
                 (None, None) => return Ok(verb_error("ws_send: missing data or data_base64")),
             };
             let conn = {
-                let mut conns = engine.ws_conns.lock().expect("ws conns lock");
+                let mut conns = engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner());
                 conns.remove(ws_id)
             };
             let Some(mut conn) = conn else {
@@ -1559,8 +2615,7 @@ fn dispatch<'a>(
                     let sent = payload.len();
                     engine
                         .ws_conns
-                        .lock()
-                        .expect("ws conns lock")
+                        .lock().unwrap_or_else(|e| e.into_inner())
                         .insert(ws_id.to_string(), conn);
                     Ok(json!({"ok": true, "ws_id": ws_id, "sent_bytes": sent}))
                 }
@@ -1579,7 +2634,7 @@ fn dispatch<'a>(
                 .unwrap_or(30_000)
                 .min(600_000);
             let conn = {
-                let mut conns = engine.ws_conns.lock().expect("ws conns lock");
+                let mut conns = engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner());
                 conns.remove(ws_id)
             };
             let Some(mut conn) = conn else {
@@ -1591,15 +2646,15 @@ fn dispatch<'a>(
                 .await;
             match outcome {
                 Ok(Ok(se_net::ws::WsMessage::Text(s))) => {
-                    engine.ws_conns.lock().expect("ws conns lock").insert(ws_id.to_string(), conn);
+                    engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner()).insert(ws_id.to_string(), conn);
                     Ok(json!({"ok": true, "ws_id": ws_id, "kind": "text", "data": s}))
                 }
                 Ok(Ok(se_net::ws::WsMessage::Binary(b))) => {
-                    engine.ws_conns.lock().expect("ws conns lock").insert(ws_id.to_string(), conn);
+                    engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner()).insert(ws_id.to_string(), conn);
                     Ok(json!({"ok": true, "ws_id": ws_id, "kind": "binary", "data_base64": imgmeta::base64_encode(&b)}))
                 }
                 Ok(Ok(se_net::ws::WsMessage::Pong(p))) => {
-                    engine.ws_conns.lock().expect("ws conns lock").insert(ws_id.to_string(), conn);
+                    engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner()).insert(ws_id.to_string(), conn);
                     Ok(json!({"ok": true, "ws_id": ws_id, "kind": "pong", "data_base64": imgmeta::base64_encode(&p)}))
                 }
                 Ok(Ok(se_net::ws::WsMessage::Close { code, reason })) => {
@@ -1609,7 +2664,7 @@ fn dispatch<'a>(
                 }
                 Ok(Err(e)) => Ok(verb_error(format!("ws_recv: {e}"))),
                 Err(_elapsed) => {
-                    engine.ws_conns.lock().expect("ws conns lock").insert(ws_id.to_string(), conn);
+                    engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner()).insert(ws_id.to_string(), conn);
                     Ok(json!({"ok": true, "ws_id": ws_id, "kind": "timeout"}))
                 }
             }
@@ -1620,7 +2675,7 @@ fn dispatch<'a>(
                 return Ok(verb_error("ws_close: missing ws_id"));
             };
             let conn = {
-                let mut conns = engine.ws_conns.lock().expect("ws conns lock");
+                let mut conns = engine.ws_conns.lock().unwrap_or_else(|e| e.into_inner());
                 conns.remove(ws_id)
             };
             let Some(conn) = conn else {
@@ -1636,11 +2691,10 @@ fn dispatch<'a>(
             let Some(js) = param(&params, "js") else {
                 return Ok(verb_error("eval: missing js"));
             };
-            let cookie_store = Some(engine.client.lock().expect("client lock").store());
+            let cookie_store = Some(engine.client.lock().unwrap_or_else(|e| e.into_inner()).store());
             let page = engine
                 .tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .get(tab_id_of(&params))
                 .map(|tab| Page {
                     url: tab.url.clone(),
@@ -1674,9 +2728,9 @@ fn dispatch<'a>(
             // mutation becomes the tab's live document — read_html and the
             // next eval both observe it, the way patchright's live DOM does.
             if let Some(slot) = writeback {
-                let pending = slot.lock().expect("writeback lock").take();
+                let pending = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(wb) = pending {
-                    let mut tabs = engine.tabs.lock().expect("tabs lock");
+                    let mut tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(tab) = tabs.get_mut(tab_id_of(&params)) {
                         if tab.html == wb.from {
                             tab.html = wb.html;
@@ -1736,22 +2790,31 @@ fn dispatch<'a>(
                     Some(_) => return Ok(verb_error("fetch: body must be a string")),
                     None => String::new(),
                 };
-                let client = engine.client.lock().expect("client lock").clone();
+                let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let hop_started = std::time::Instant::now();
                 // Same initiator presentation as the document path: the tab's
                 // current page is the data call's initiator.
                 let initiator = {
-                    let tabs = engine.tabs.lock().expect("tabs lock");
+                    let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                     tabs.get(tab_id_of(&params)).map(|t| t.url.clone())
                 };
-                let resp =
-                    match client
-                        .request_data(url, &method, &custom, &body, initiator.as_deref(), se_net::DataKind::Data)
-                        .await
-                    {
+                let call = client
+                    .request_data(url, &method, &custom, &body, initiator.as_deref(), se_net::DataKind::Data);
+                let resp = match deadline_param(&params) {
+                    Some(d) => match tokio::time::timeout(d, call).await {
                         Ok(r) => r,
-                        Err(e) => return Ok(verb_error(format!("fetch: {e}"))),
-                    };
+                        Err(_) => {
+                            return Ok(verb_error(format!(
+                                "fetch: no answer within timeout_ms ({} ms)", d.as_millis()
+                            )))
+                        }
+                    },
+                    None => call.await,
+                };
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) => return Ok(verb_error(format!("fetch: {e}"))),
+                };
                 engine.net_log.record(
                     "fetch",
                     &method,
@@ -1781,15 +2844,27 @@ fn dispatch<'a>(
             // or challenge page rides in an `ok: true` envelope — the ladder's
             // refusal check is status/signature-driven, so the verb must not
             // turn a site-level "no" into a transport error.
-            let client = engine.client.lock().expect("client lock").clone();
+            let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let hop_started = std::time::Instant::now();
             // A page-context HTTP fetch presents the tab's page as initiator
             // (Referer + same-origin Sec-Fetch-Site), like a subresource.
             let initiator = {
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 tabs.get(tab_id_of(&params)).map(|t| t.url.clone())
             };
-            let resp = match client.navigate(url, initiator.as_deref()).await {
+            let nav = client.navigate(url, initiator.as_deref());
+            let resp = match deadline_param(&params) {
+                Some(d) => match tokio::time::timeout(d, nav).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Ok(verb_error(format!(
+                            "fetch: no answer within timeout_ms ({} ms)", d.as_millis()
+                        )))
+                    }
+                },
+                None => nav.await,
+            };
+            let resp = match resp {
                 Ok(r) => r,
                 Err(e) => return Ok(verb_error(format!("fetch: {e}"))),
             };
@@ -1800,11 +2875,11 @@ fn dispatch<'a>(
                 resp.status,
                 hop_started.elapsed(),
             );
-            let bot = detect_bot(&resp.body);
+            let bot = bot_verdict(&resp.body, &resp.final_url, &params);
             // fetch leaves a loaded tab behind, so fetch → eval composes the
             // same way it does after the patchright sidecar's escalation.
             let tab = {
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 Tab::after_navigation(
                     tabs.get(tab_id_of(&params)),
                     &resp.final_url,
@@ -1814,8 +2889,7 @@ fn dispatch<'a>(
             };
             engine
                 .tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .insert(tab_id_of(&params).to_string(), tab);
             // The origin's content-type rides the envelope: without it the
             // caller has to assume text/html, and a binary body (a PDF is
@@ -1854,9 +2928,20 @@ fn dispatch<'a>(
                 out["blocked"] = json!(true);
                 out["bot_reason"] = json!(reason);
             }
+            // `binary: true`: a non-text body rides the envelope as the bytes
+            // the origin sent. `html` is a lossy text decode -- a PDF read
+            // through it is unusable, and the caller's only other route is a
+            // second download WITHOUT this session's cookies, which a gated
+            // file refuses.
+            if bool_param(&params, "binary") && is_binary_body(&content_type, &resp.body_bytes) {
+                out["body_base64"] = json!(imgmeta::base64_encode(&resp.body_bytes));
+                out["body_bytes"] = json!(resp.body_bytes.len());
+            }
             if bool_param(&params, "render") {
                 let budget = settle_ms_param(&params).unwrap_or(se_js::bridge::TIMER_BUDGET);
-                let stats = engine.render_tab(tab_id_of(&params), budget).await;
+                let stats = JS_OPTS
+                    .scope(js_opts_param(&params), engine.render_tab(tab_id_of(&params), budget))
+                    .await;
                 out["rendered"] = json!(true);
                 out["render_scripts"] = json!(stats.scripts);
                 out["render_skipped"] = json!(stats.skipped);
@@ -1864,6 +2949,9 @@ fn dispatch<'a>(
                 out["render_errors_total"] = json!(stats.errors_total);
                 out["render_ms"] = json!(stats.ms);
                 out["render_nav_hops"] = json!(stats.nav_hops);
+                if !stats.page_errors.is_empty() {
+                    out["page_errors"] = json!(stats.page_errors);
+                }
                 // A page-script navigation follow replaced the document:
                 // the envelope reports where the render actually LANDED.
                 if let (Some(u), Some(s)) = (stats.final_url, stats.final_status) {
@@ -1872,7 +2960,7 @@ fn dispatch<'a>(
                 }
                 // The tab adopted the rendered DOM; the envelope's html
                 // should be the same document read_html returns.
-                let tabs = engine.tabs.lock().expect("tabs lock");
+                let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(tab) = tabs.get(tab_id_of(&params)) {
                     out["html"] = json!(tab.html);
                 }
@@ -1883,7 +2971,7 @@ fn dispatch<'a>(
         "cookies_get" => {
             // The live jar, in Playwright shape — including anything servers
             // set during the session, not just what was injected.
-            let client = engine.client.lock().expect("client lock").clone();
+            let client = engine.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let cookies: Vec<Value> = client
                 .store()
                 .snapshot()
@@ -1908,8 +2996,7 @@ fn dispatch<'a>(
         "close_tab" => {
             engine
                 .tabs
-                .lock()
-                .expect("tabs lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .remove(tab_id_of(&params));
             Ok(json!({"ok": true}))
         }
@@ -1946,7 +3033,7 @@ fn dispatch<'a>(
         }
 
         "session_reset" => {
-            engine.client.lock().expect("client lock").store().clear();
+            engine.client.lock().unwrap_or_else(|e| e.into_inner()).store().clear();
             // The protocol pins this: session_reset clears the cookie jar
             // AND any per-origin storage — a fresh session must not inherit
             // a gated page's leftover state. The network log is session
@@ -1962,7 +3049,7 @@ fn dispatch<'a>(
             // it -- their next read_html/eval answered "unknown tab"
             // (searchio bug 161). What each tab holds as session state is
             // wiped; its document, url and referrer are not.
-            let tabs = engine.tabs.lock().expect("tabs lock");
+            let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
             for tab in tabs.values() {
                 tab.session_storage.clear();
                 tab.window_name.clear();
@@ -1973,8 +3060,7 @@ fn dispatch<'a>(
             drop(tabs);
             engine
                 .local_pool
-                .lock()
-                .expect("local pool lock")
+                .lock().unwrap_or_else(|e| e.into_inner())
                 .clear();
             Ok(json!({"ok": true, "cookies_cleared": true}))
         }
@@ -2212,13 +3298,12 @@ mod tests {
         tab.window_name.set("ctx".into());
         engine
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .insert("other-caller".into(), tab);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let r = rt.block_on(dispatch(&engine, "session_reset", json!({}))).unwrap();
         assert_eq!(r["ok"], json!(true));
-        let tabs = engine.tabs.lock().expect("tabs lock");
+        let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
         let kept = tabs.get("other-caller").expect("the tab survives a session reset");
         assert_eq!(kept.url, "http://a.test/page");
         assert!(kept.html.contains("still here"), "the document is untouched");
@@ -2308,7 +3393,7 @@ mod tests {
         assert!(r["result"].as_str().unwrap().contains("Chrome/145"));
 
         // With a tab: the DOM bridge serves `document`.
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "default".to_string(),
             Tab {
                 url: "https://example.test/".into(),
@@ -2334,7 +3419,7 @@ mod tests {
         // behavior, where previously mutations died with the eval's State.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let engine = Engine::default();
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "default".to_string(),
             Tab {
                 url: "https://example.test/".into(),
@@ -2398,14 +3483,13 @@ mod tests {
         };
         // A stale writeback left pending across the navigation (what a racing
         // goto would leave behind).
-        *tab.writeback.lock().expect("writeback lock") = Some(se_js::bridge::MutationWriteback {
+        *tab.writeback.lock().unwrap_or_else(|e| e.into_inner()) = Some(se_js::bridge::MutationWriteback {
             from: "<html><body><p>old document</p></body></html>".into(),
             html: "<html><body><p>STALE</p></body></html>".into(),
         });
         engine
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .insert("default".to_string(), tab);
 
         // Any eval triggers the adoption pass; the guard must drop the stale
@@ -2438,7 +3522,7 @@ mod tests {
         // synthetic wrapper's attribute into the live tree in one eval.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let engine = Engine::default();
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "default".to_string(),
             Tab {
                 url: "https://example.test/".into(),
@@ -2703,8 +3787,7 @@ mod tests {
         // Seed the jar so the data call's Cookie header is provable.
         engine
             .client
-            .lock()
-            .expect("client lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .store()
             .store_set_cookie("seeded=1; Path=/", &format!("http://{addr}/"));
 
@@ -2738,8 +3821,7 @@ mod tests {
         // The response Set-Cookie LANDED in the session jar.
         let jar = engine
             .client
-            .lock()
-            .expect("client lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .store()
             .snapshot();
         assert!(
@@ -2783,7 +3865,7 @@ mod tests {
         // selector are verb errors like read_html's.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let engine = Engine::default();
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "t".to_string(),
             Tab {
                 url: "http://x.test/page".into(),
@@ -2850,7 +3932,7 @@ mod tests {
         // bad selector are verb errors like read_html's.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let engine = Engine::default();
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "s".to_string(),
             Tab {
                 url: "http://x.test/page".into(),
@@ -2984,11 +4066,10 @@ mod tests {
         let engine = Engine::default();
         engine
             .client
-            .lock()
-            .expect("client lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .store()
             .store_set_cookie("seeded=1; Path=/", &format!("http://{addr}/"));
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "i".to_string(),
             Tab {
                 url: format!("http://{addr}/gallery"),
@@ -3035,7 +4116,7 @@ mod tests {
             v
         };
         let data_url = format!("data:image/gif;base64,{}", imgmeta::base64_encode(&gif));
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "d".to_string(),
             Tab {
                 url: "http://x.test/inline".into(),
@@ -3091,7 +4172,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(r["ok"], json!(false));
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "bare".to_string(),
             Tab {
                 url: "http://x.test/bare".into(),
@@ -3108,7 +4189,7 @@ mod tests {
             .unwrap();
         assert_eq!(r["ok"], json!(false));
         // Corrupt base64 in a data: URL is a verb error, not a panic.
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "corrupt".to_string(),
             Tab {
                 url: "http://x.test/corrupt".into(),
@@ -3231,8 +4312,7 @@ mod tests {
         // must present this cookie, proving the upgrade rides the session.
         engine
             .client
-            .lock()
-            .expect("client lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .store()
             .store_set_cookie("seeded=1; Path=/", &format!("http://{addr}/"));
 
@@ -3435,7 +4515,7 @@ mod tests {
             .unwrap();
         assert_eq!(r["ok"], json!(true));
         // The post-goto state: the fresh tab has landed on origin A.
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "fresh".to_string(),
             Tab {
                 url: "http://a.test/back".into(),
@@ -3494,8 +4574,7 @@ mod tests {
         tab.session_storage.set("bsess".into(), "secret".into());
         engine
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .insert("default".to_string(), tab);
 
         let r = rt
@@ -3587,8 +4666,7 @@ mod tests {
             .set("mark".into(), "1".into());
         engine_a
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .insert("default".to_string(), tab);
         let exported = rt
             .block_on(dispatch(&engine_a, "storage_state_get", Value::Null))
@@ -3644,7 +4722,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let engine = Engine::default();
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "yt".to_string(),
             Tab {
                 url: "https://www.youtube.com/results?search_query=rust".into(),
@@ -3738,7 +4816,7 @@ mod tests {
         assert_eq!(r["cookies"], json!(1));
 
         // A tab on the loopback origin; the eval'd page fetch must carry it.
-        engine.tabs.lock().expect("tabs lock").insert(
+        engine.tabs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "s".to_string(),
             Tab {
                 url: format!("http://{addr}/page"),
@@ -3796,8 +4874,7 @@ mod tests {
                     };
                     let body = format!("{path}|{}|{}", pick("referer"), pick("sec-fetch-site"));
                     seen_server
-                        .lock()
-                        .expect("seen lock")
+                        .lock().unwrap_or_else(|e| e.into_inner())
                         .push(body.clone());
                     socket
                         .write_all(
@@ -3831,7 +4908,7 @@ mod tests {
         assert_eq!(r["ok"], json!(true));
         assert_eq!(r["status"], json!(200));
 
-        let requests = seen.lock().expect("seen lock").clone();
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(requests.len(), 2, "server saw {} requests", requests.len());
         // First load: address-bar — no Referer, Sec-Fetch-Site: none.
         assert!(
@@ -4031,7 +5108,7 @@ mod tests {
         // And the reopened-session flow works off the restore: the pool is
         // keyed by origin, so once the tab lands on the saved origin its
         // evals read the restored localStorage directly — no archive consult.
-        let tabs = engine.tabs.lock().expect("tabs lock");
+        let tabs = engine.tabs.lock().unwrap_or_else(|e| e.into_inner());
         let tab = tabs.get("default").expect("default tab exists after load");
         let restored = Tab::after_navigation(
             Some(tab),
@@ -4226,8 +5303,7 @@ mod tests {
         tab.html = html.to_string();
         engine
             .tabs
-            .lock()
-            .expect("tabs lock")
+            .lock().unwrap_or_else(|e| e.into_inner())
             .insert(tab_id.to_string(), tab);
     }
 
@@ -4941,3 +6017,407 @@ window.addEventListener("DOMContentLoaded", function () { document.getElementByI
         );
     }
 }
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn seed_tab(engine: &Engine, id: &str) {
+        engine.tabs.lock().unwrap().insert(id.to_string(), Tab {
+            url: String::new(),
+            referrer: String::new(),
+            html: String::new(),
+            session_storage: Default::default(),
+            session_archive: HashMap::new(),
+            window_name: Default::default(),
+            writeback: Default::default(),
+        });
+        engine.tab_touch(id, 0);
+    }
+
+    #[test]
+    fn ws_connect_refuses_a_header_that_would_split_the_handshake() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::default();
+        for headers in [
+            json!({"X-A": "v\r\nX-Injected: 1"}),
+            json!({"X A": "v"}),
+            json!({"X-A\r\nHost": "evil"}),
+        ] {
+            let r = rt
+                .block_on(dispatch(
+                    &engine,
+                    "ws_connect",
+                    json!({"url": "ws://127.0.0.1:9/", "headers": headers}),
+                ))
+                .unwrap();
+            assert_eq!(r["ok"], json!(false));
+            assert!(r["error"].as_str().unwrap().contains("not a valid header"), "{r}");
+        }
+        // The link-local class is refused on this path too.
+        let r = rt
+            .block_on(dispatch(&engine, "ws_connect", json!({"url": "ws://169.254.169.254/"})))
+            .unwrap();
+        assert!(r["error"].as_str().unwrap().contains("refused target"), "{r}");
+    }
+
+    #[test]
+    fn idle_tabs_are_swept_and_busy_tabs_are_kept() {
+        let engine = Engine::default();
+        for id in ["a", "b", "c"] {
+            seed_tab(&engine, id);
+        }
+        assert_eq!(engine.tabs.lock().unwrap().len(), 3);
+        // Nothing is idle yet.
+        assert_eq!(engine.sweep_tabs(Some(std::time::Duration::from_secs(60)), 0), 0);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        engine.tab_touch("b", 0); // b was just used
+        engine.tab_touch("c", 1); // c has a request in flight
+        let n = engine.sweep_tabs(Some(std::time::Duration::from_millis(50)), 0);
+        assert_eq!(n, 1);
+        let tabs = engine.tabs.lock().unwrap();
+        assert!(!tabs.contains_key("a") && tabs.contains_key("b") && tabs.contains_key("c"));
+        drop(tabs);
+        // Once its request ends and it idles, c goes too.
+        engine.tab_touch("c", -1);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(engine.sweep_tabs(Some(std::time::Duration::from_millis(50)), 0), 2);
+        assert_eq!(engine.tabs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_tab_cap_evicts_least_recently_used_first() {
+        let engine = Engine::default();
+        for id in ["t1", "t2", "t3", "t4", "t5"] {
+            seed_tab(&engine, id);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine.tab_touch("t1", 0); // t1 becomes the most recent
+        assert_eq!(engine.sweep_tabs(None, 3), 2);
+        let tabs = engine.tabs.lock().unwrap();
+        let mut left: Vec<&String> = tabs.keys().collect();
+        left.sort();
+        assert_eq!(left, ["t1", "t4", "t5"]);
+        drop(tabs);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(dispatch(&engine, "health", json!({}))).unwrap();
+        assert_eq!(h["tabs_swept"], json!(2));
+        assert_eq!(h["tabs"], json!(3));
+        // A swept tab is simply a fresh tab on its next use.
+        seed_tab(&engine, "t2");
+        assert!(engine.tabs.lock().unwrap().contains_key("t2"));
+    }
+
+    #[test]
+    fn a_runaway_script_is_terminated_and_the_next_eval_runs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let actor = JsActor::with_grace(Some(std::time::Duration::from_millis(300)));
+        let started = std::time::Instant::now();
+        let out = rt.block_on(actor.eval_with_budget(
+            None,
+            "while (true) {}".to_string(),
+            std::time::Duration::from_millis(100),
+        ));
+        let err = out.expect_err("an endless loop must not return a value");
+        assert!(err.contains("time limit"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // The isolate is usable again: the termination was cleared.
+        let next = rt.block_on(actor.eval(None, "1 + 2".to_string()));
+        assert_eq!(next.unwrap(), json!(3));
+        let health = actor.health();
+        assert_eq!(health["terminated"], json!(1));
+        assert_eq!(health["alive"], json!(true));
+    }
+
+    #[test]
+    fn an_abandoned_eval_is_skipped() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let actor = JsActor::with_grace(None);
+        rt.block_on(async {
+            // First eval holds the JS thread ~300 ms; the second caller gives
+            // up while queued, so its script must never run.
+            let slow = actor.eval(
+                None,
+                "var t = Date.now(); while (Date.now() - t < 300) {} 1".to_string(),
+            );
+            let gone = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                actor.eval(None, "2".to_string()),
+            );
+            let (a, b) = tokio::join!(slow, gone);
+            assert_eq!(a.unwrap(), json!(1));
+            assert!(b.is_err(), "the queued eval should have timed out");
+            assert_eq!(actor.eval(None, "3".to_string()).await.unwrap(), json!(3));
+        });
+        assert_eq!(actor.health()["skipped_abandoned"], json!(1));
+    }
+
+    #[test]
+    fn host_strings_reach_js_as_unicode_not_latin1() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::default();
+        engine.tabs.lock().unwrap().insert(
+            "u".to_string(),
+            Tab::after_navigation(None, "https://example.test/", String::new(),
+                "<html><body><p>x</p></body></html>".to_string()),
+        );
+        let js = "localStorage.setItem('k', 'n\\u00e9 \\u65e5\\u672c'); \
+                  var v = localStorage.getItem('k'); [v.length, v.charCodeAt(1), v.charCodeAt(3)]";
+        let r = rt
+            .block_on(dispatch(&engine, "eval", json!({"tab_id": "u", "js": js})))
+            .unwrap();
+        assert_eq!(r["result"], json!([5, 0xe9, 0x65e5]), "{r}");
+    }
+
+    #[test]
+    fn scoped_bot_detection_ignores_mentions() {
+        let article = "<p>Our login flow uses arkoselabs.com and posts to /login/checkpoint.</p>\
+                       <script>var cfg = {\"feed_units\":null, host: \"arkoselabs.com\"};</script>";
+        // The bare form flags a page that only mentions the vendor.
+        assert!(detect_bot(article).is_some());
+        assert_eq!(detect_bot_scoped(article, "https://blog.example.com/a"), None);
+        // A presented challenge still counts, wherever it is served.
+        assert_eq!(
+            detect_bot_scoped("<iframe src=\"https://client-api.arkoselabs.com/fc/\"></iframe>",
+                              "https://shop.example.com/"),
+            Some("arkose_enforcement")
+        );
+        assert_eq!(
+            detect_bot_scoped("<div id=\"px-captcha\"></div>", "https://shop.example.com/"),
+            Some("perimeterx_challenge")
+        );
+        // Facebook signatures on Facebook hosts only.
+        assert_eq!(
+            detect_bot_scoped("{\"feed_units\":null}", "https://www.facebook.com/marketplace/"),
+            Some("empty_feed_units")
+        );
+        assert_eq!(detect_bot_scoped("{\"feed_units\":null}", "https://api.example.com/x"), None);
+        assert_eq!(
+            detect_bot_scoped("<a href=\"/login/checkpoint\">x</a>", "https://m.facebook.com/"),
+            Some("login_checkpoint")
+        );
+    }
+
+    #[test]
+    fn binary_bodies_are_recognised() {
+        assert!(is_binary_body("application/pdf", b"%PDF-1.7"));
+        assert!(is_binary_body("text/html", b"%PDF-1.7 mislabeled"));
+        assert!(is_binary_body("application/octet-stream", b"\x00\x01"));
+        assert!(!is_binary_body("text/html; charset=utf-8", b"<html>"));
+        assert!(!is_binary_body("application/ld+json", b"{}"));
+        assert!(!is_binary_body("", b"<html>"));
+    }
+
+    #[test]
+    fn deadline_param_is_clamped() {
+        assert_eq!(deadline_param(&json!({})), None);
+        assert_eq!(deadline_param(&json!({"timeout_ms": 5})),
+                   Some(std::time::Duration::from_millis(100)));
+        assert_eq!(deadline_param(&json!({"timeout_ms": "2500"})),
+                   Some(std::time::Duration::from_millis(2500)));
+    }
+}
+
+#[cfg(test)]
+mod prelude_tests {
+    use super::*;
+
+    fn render(html: &str, prelude: bool) -> (RenderStats, String) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::default();
+        engine.tabs.lock().unwrap().insert(
+            "default".to_string(),
+            Tab::after_navigation(None, "https://example.test/a/b?x=1", String::new(), html.to_string()),
+        );
+        let opts = JsOpts { prelude, ..JsOpts::default() };
+        let stats = rt.block_on(JS_OPTS.scope(
+            opts,
+            engine.render_tab("default", std::time::Duration::from_millis(800)),
+        ));
+        let out = engine.tabs.lock().unwrap().get("default").unwrap().html.clone();
+        (stats, out)
+    }
+
+    const PAGE: &str = r#"<html><head><title>t</title></head><body><div id="o"></div><script>
+      var u = new URL("../c?q=caf%C3%A9&n=2#h", location.href);
+      var p = new URLSearchParams("a=1&b=two+words");
+      p.append("c", "x y");
+      var h = new Headers({"Content-Type": "text/plain"});
+      var bits = [u.pathname, u.searchParams.get("q"), u.origin, p.toString(), atob(btoa("round trip")),
+                  h.get("content-type"), document.head ? document.head.tagName : "nohead"];
+      window.onload = function () {
+        document.getElementById("o").innerHTML = "<p id='done'>" + bits.join("|") + "</p>";
+      };
+    </script></body></html>"#;
+
+    #[test]
+    fn prelude_supplies_the_globals_and_fires_load() {
+        let (stats, html) = render(PAGE, true);
+        assert_eq!(stats.scripts, 1, "errors: {:?} {:?}", stats.errors, stats.page_errors);
+        assert!(
+            html.contains("/c|caf\u{e9}|https://example.test|a=1&amp;b=two+words&amp;c=x+y|round trip|text/plain|HEAD")
+                || html.contains("/c|caf\u{e9}|https://example.test|a=1&b=two+words&c=x+y|round trip|text/plain|HEAD"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn without_the_prelude_the_same_page_fails_as_before() {
+        let (stats, html) = render(PAGE, false);
+        assert!(!html.contains("round trip|"), "{html}");
+        assert_eq!(stats.scripts, 0);
+        assert!(stats.page_errors.is_empty());
+    }
+
+    #[test]
+    fn a_throwing_load_handler_is_reported_not_fatal() {
+        let (stats, _) = render(
+            "<html><body><script>window.addEventListener('load', function(){ console.error('boom', 7); });</script></body></html>",
+            true,
+        );
+        assert_eq!(stats.scripts, 1);
+        assert!(stats.page_errors.iter().any(|e| e.contains("boom 7")), "{:?}", stats.page_errors);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn noncontent_hosts_are_recognised_by_host_not_by_mention() {
+        assert!(noncontent_script("https://www.googletagmanager.com/gtm.js?id=X"));
+        assert!(noncontent_script("https://connect.facebook.net/en_US/fbevents.js"));
+        assert!(noncontent_script("https://www.google.com/recaptcha/api.js"));
+        assert!(!noncontent_script("https://cdn.example.com/app.js"));
+        assert!(!noncontent_script("https://example.com/vendor/googletagmanager.com.js"));
+        assert!(!noncontent_script("https://www.google.com/maps/api.js"));
+        assert!(!noncontent_script("not a url"));
+    }
+}
+
+#[cfg(test)]
+mod fetch_pool_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A server whose every answer takes 120 ms, counting how many requests
+    /// were being served at once.
+    fn slow_server() -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+        let (peak2, live2) = (peak.clone(), live.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (peak, live) = (peak2.clone(), live2.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    let body = format!("part{}", path.rsplit('/').next().unwrap_or(""));
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        (format!("http://{addr}"), peak)
+    }
+
+    /// The switch is process-wide (one JS thread reads it in production);
+    /// tests that set it differently must not overlap.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn render(base: &str, fetch_pool: bool) -> (RenderStats, String, u128) {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let html = r#"<html><head><title>t</title></head><body><div id="o"></div><script>
+          var jobs = [];
+          for (var i = 0; i < 6; i++) { jobs.push(fetch("/api/" + i).then(function (r) { return r.text(); })); }
+          Promise.all(jobs).then(function (parts) {
+            document.getElementById("o").innerHTML = "<p id='done'>" + parts.join(",") + "</p>";
+          });
+        </script></body></html>"#;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::default();
+        engine.tabs.lock().unwrap().insert(
+            "default".to_string(),
+            Tab::after_navigation(None, &format!("{base}/page"), String::new(), html.to_string()),
+        );
+        let opts = JsOpts { prelude: true, quiesce: 3, fetch_pool, ..JsOpts::default() };
+        let t0 = std::time::Instant::now();
+        let stats = rt.block_on(JS_OPTS.scope(
+            opts,
+            engine.render_tab("default", std::time::Duration::from_millis(4000)),
+        ));
+        let ms = t0.elapsed().as_millis();
+        let out = engine.tabs.lock().unwrap().get("default").unwrap().html.clone();
+        (stats, out, ms)
+    }
+
+    const DONE: &str = "part0,part1,part2,part3,part4,part5";
+
+    #[test]
+    fn without_the_pool_six_fetches_run_one_after_another() {
+        let (base, peak) = slow_server();
+        let (stats, out, ms) = render(&base, false);
+        assert!(out.contains(DONE), "{out} {:?}", stats.errors);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert!(ms >= 700, "six serial 120 ms answers took {ms} ms");
+    }
+
+    #[test]
+    fn with_the_pool_six_fetches_overlap_and_settle_in_order() {
+        let (base, peak) = slow_server();
+        let (stats, out, ms) = render(&base, true);
+        assert!(out.contains(DONE), "{out} {:?}", stats.errors);
+        assert!(stats.page_errors.is_empty(), "{:?}", stats.page_errors);
+        assert!(peak.load(Ordering::SeqCst) >= 4, "peak {}", peak.load(Ordering::SeqCst));
+        assert!(ms < 600, "six overlapping 120 ms answers took {ms} ms");
+    }
+
+    #[test]
+    fn a_failed_fetch_rejects_from_the_pump() {
+        let html = r#"<html><body><div id="o"></div><script>
+          fetch("http://127.0.0.1:9/nothing").then(function () {
+            document.getElementById("o").innerHTML = "<p>resolved</p>";
+          }, function (e) {
+            document.getElementById("o").innerHTML = "<p id='r'>rejected " + String(e).slice(0, 9) + "</p>";
+          });
+        </script></body></html>"#;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::default();
+        engine.tabs.lock().unwrap().insert(
+            "default".to_string(),
+            Tab::after_navigation(None, "http://127.0.0.1:9/page", String::new(), html.to_string()),
+        );
+        let opts = JsOpts { prelude: true, quiesce: 3, fetch_pool: true, ..JsOpts::default() };
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        rt.block_on(JS_OPTS.scope(
+            opts,
+            engine.render_tab("default", std::time::Duration::from_millis(8000)),
+        ));
+        let out = engine.tabs.lock().unwrap().get("default").unwrap().html.clone();
+        assert!(out.contains("rejected TypeError"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod livedom_tests;
+#[cfg(test)]
+mod modules_tests;
+#[cfg(test)]
+mod read_tests;

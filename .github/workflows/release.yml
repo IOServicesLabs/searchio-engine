@@ -49,8 +49,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # The `impersonate` feature (Chrome TLS + HTTP/2 fingerprint) builds
+      # BoringSSL, which needs NASM on Windows and cmake + libclang on Linux.
+      - name: BoringSSL build tools (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - name: BoringSSL build tools (windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      # A leg whose BoringSSL build fails still ships a binary: it falls back
+      # to the plain-TLS build and says so in the job log.
       - name: Build (release)
-        run: cargo build --release --locked --bin se-serve --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if cargo build --release --locked --bin se-serve --features impersonate --target ${{ matrix.target }}; then
+            echo "built with TLS impersonation"
+          else
+            echo "::warning::impersonate build failed on ${{ matrix.target }}; shipping the plain-TLS binary"
+            cargo build --release --locked --bin se-serve --target ${{ matrix.target }}
+          fi
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         run: |

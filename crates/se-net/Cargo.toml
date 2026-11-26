@@ -31,7 +31,19 @@ cookie_store = "0.22"
 # meta prescan): WHATWG label->encoding resolution. Already locked at 0.8.35
 # in the workspace tree — no new lockfile entries.
 encoding_rs = "0.8"
+# Statistical fallback for bodies that declare no charset and are not UTF-8
+# (SE_CHARSET_DETECT). Firefox's detector, built on encoding_rs.
+chardetng = "0.1"
 reqwest = { version = "0.13.4", features = ["cookies", "gzip", "brotli", "zstd", "deflate"] }
 thiserror.workspace = true
 tokio = { version = "1.53.1", features = ["full"] }
 url = "2"
+# Browser TLS + HTTP/2 impersonation (SE_TLS_IMPERSONATE): a BoringSSL-backed
+# client that sends Chrome's ClientHello and h2 preface. Optional because it
+# compiles BoringSSL (needs cmake + NASM + libclang on Windows).
+wreq = { version = "=6.0.0-rc.31", optional = true, features = ["cookies", "gzip", "brotli", "zstd", "deflate", "stream"] }
+futures-util = { version = "0.3", optional = true }
+wreq-util = { version = "=3.0.0-rc.14", optional = true }
+
+[features]
+impersonate = ["dep:wreq", "dep:wreq-util", "dep:futures-util"]

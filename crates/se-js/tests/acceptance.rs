@@ -247,7 +247,7 @@ fn fingerprint_surface_is_consistent_with_the_presented_ua() {
     assert_eq!(out["appName"], serde_json::json!("Netscape"));
     assert_eq!(
         out["appVersion"],
-        serde_json::json!("5.0 (Windows NT 10.0; Win64; x64)")
+        serde_json::json!("5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
     );
     assert_eq!(out["product"], serde_json::json!("Gecko"));
     assert_eq!(out["productSub"], serde_json::json!("20030107"));
@@ -255,7 +255,8 @@ fn fingerprint_surface_is_consistent_with_the_presented_ua() {
     assert_eq!(out["vendorSub"], serde_json::json!(""));
     assert_eq!(out["platform"], serde_json::json!("Win32"));
     assert_eq!(out["language"], serde_json::json!("en-US"));
-    assert_eq!(out["languages"], serde_json::json!("en-US"));
+    // The list the wire's Accept-Language ("en-US,en;q=0.9") implies.
+    assert_eq!(out["languages"], serde_json::json!("en-US,en"));
     assert_eq!(out["hardwareConcurrency"], serde_json::json!(8));
     assert_eq!(out["deviceMemory"], serde_json::json!(8));
     assert_eq!(out["maxTouchPoints"], serde_json::json!(0));

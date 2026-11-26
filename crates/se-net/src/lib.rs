@@ -26,6 +26,8 @@ pub mod h2cap;
 /// page-side `WebSocket` stub stays shape-only forever — the AGENT owns the
 /// socket through the se-serve verbs.
 pub mod ws;
+#[cfg(feature = "impersonate")]
+mod imp;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -213,7 +215,7 @@ type DnsLookup = Arc<
 /// promotes to the typed variant. reqwest dials exactly the addresses this
 /// returns, so the dial observes no second resolution -- no TOCTOU window.
 pub struct GuardedResolver {
-    lookup: DnsLookup,
+    pub(crate) lookup: DnsLookup,
 }
 
 impl GuardedResolver {
@@ -335,25 +337,66 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     None
 }
 
+/// Charset detection switch (`SE_CHARSET_DETECT=1`): a byte-order mark
+/// outranks every declaration, and a body that declares nothing and is not
+/// valid UTF-8 goes to a statistical detector instead of lossy UTF-8.
+pub fn charset_detect_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SE_CHARSET_DETECT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    })
+}
+
 /// Decode a response body the way a browser does: the content-type header's
 /// charset wins; HTML without one gets the meta prescan; UTF-8 with lossy
 /// replacement is the fallback. Decoding every body as lossy UTF-8 was the
 /// Shift_JIS mojibake bug — searchio's bench/span.py ctl.charset_shift_jis
 /// caught 156 U+FFFD and a lost marker on a header-declared page at tier 2.
 fn decode_body(bytes: &[u8], headers: &[(String, String)]) -> String {
+    decode_body_with(bytes, headers, charset_detect_enabled())
+}
+
+fn decode_body_with(bytes: &[u8], headers: &[(String, String)], detect: bool) -> String {
     let ctype = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
+    if detect {
+        // WHATWG: a BOM is the most authoritative signal, above the header.
+        if let Some((enc, _)) = encoding_rs::Encoding::for_bom(bytes) {
+            return enc.decode(bytes).0.into_owned();
+        }
+    }
     if let Some(label) = charset_label(ctype) {
         if let Some(enc) = encoding_rs::Encoding::for_label(&label) {
             return enc.decode(bytes).0.into_owned();
         }
     }
-    if ctype.to_ascii_lowercase().contains("html") {
+    let lower = ctype.to_ascii_lowercase();
+    if lower.contains("html") {
         if let Some(enc) = sniff_meta_charset(bytes) {
             return enc.decode(bytes).0.into_owned();
+        }
+    }
+    if detect {
+        if let Err(_) = std::str::from_utf8(bytes) {
+            // Nothing declared and not UTF-8. Binary payloads are left to the
+            // lossy path (a detector would invent an encoding for a PNG).
+            let texty = lower.is_empty()
+                || lower.starts_with("text/")
+                || lower.contains("html")
+                || lower.contains("xml")
+                || lower.contains("json")
+                || lower.contains("javascript");
+            if texty && !bytes[..bytes.len().min(4096)].contains(&0) {
+                let mut det = chardetng::EncodingDetector::new();
+                det.feed(&bytes[..bytes.len().min(256 * 1024)], true);
+                let enc = det.guess(None, true);
+                if enc != encoding_rs::UTF_8 {
+                    return enc.decode(bytes).0.into_owned();
+                }
+            }
         }
     }
     String::from_utf8_lossy(bytes).into_owned()
@@ -473,6 +516,44 @@ fn parse_refresh_content(content: &str) -> Option<(f64, Option<String>)> {
     Some((delay, Some(raw.to_string())))
 }
 
+/// Blank out (same byte length, so offsets still index the original) the two
+/// places where `<meta http-equiv=refresh>` is text, not a tag: HTML comments
+/// and script bodies. A commented-out redirect, or one a script only writes
+/// under some condition, navigates no browser -- and used to navigate us.
+fn mask_non_markup(lower: String) -> String {
+    let mut bytes = lower.into_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        let (open_len, close): (usize, &[u8]) = if rest.starts_with(b"<!--") {
+            (4, b"-->")
+        } else if rest.starts_with(b"<script")
+            && rest.get(7).is_some_and(|b| !b.is_ascii_alphanumeric())
+        {
+            match rest.iter().position(|b| *b == b'>') {
+                Some(gt) => (gt + 1, b"</script"),
+                None => break,
+            }
+        } else {
+            i += 1;
+            continue;
+        };
+        let body = i + open_len;
+        let end = bytes[body..]
+            .windows(close.len())
+            .position(|w| w == close)
+            .map(|p| body + p)
+            .unwrap_or(bytes.len());
+        for b in &mut bytes[body..end] {
+            *b = b' ';
+        }
+        i = (end + close.len()).min(bytes.len());
+    }
+    // Whole runs between ASCII delimiters were overwritten with ASCII, so
+    // the buffer is still valid UTF-8.
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
 /// The navigation a document's first meta-refresh tag asks for -- the
 /// absolute target, or `None` when the document is served as-is.
 fn meta_refresh_target(res: &Response) -> Option<String> {
@@ -491,7 +572,7 @@ fn meta_refresh_target(res: &Response) -> Option<String> {
     // Char-boundary-safe head window: if 64 KiB lands mid-character, scan
     // the whole body rather than panic (the tag is not near the cut anyway).
     let head = res.body.get(..META_HEAD_BYTES).unwrap_or(&res.body);
-    let lower = head.to_ascii_lowercase();
+    let lower = mask_non_markup(head.to_ascii_lowercase());
     let mut rest = lower.as_str();
     let mut off = 0usize; // byte offset of `rest` within head (== lower)
     while let Some(m) = rest.find("<meta") {
@@ -807,6 +888,22 @@ pub struct Client {
     /// The session fingerprint UA, kept so `navigate` can place it inside
     /// the hand-ordered header block (see `document_headers`).
     ua: String,
+    /// The browser-TLS transport (`SE_TLS_IMPERSONATE`): when present every
+    /// document and data request rides it instead of `inner`.
+    #[cfg(feature = "impersonate")]
+    imp: Option<imp::ImpClient>,
+}
+
+/// Was this binary compiled with the browser-TLS transport?
+pub const TLS_IMPERSONATE_BUILT: bool = cfg!(feature = "impersonate");
+
+/// `SE_TLS_IMPERSONATE=1`: carry requests over the browser-TLS transport.
+/// Read once per client; a binary built without the feature ignores it.
+pub fn tls_impersonate_enabled() -> bool {
+    TLS_IMPERSONATE_BUILT
+        && std::env::var("SE_TLS_IMPERSONATE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
 }
 
 /// Client-hint identity — the ONE source of truth for both the wire headers
@@ -974,6 +1071,9 @@ pub fn subresource_fetch(
         .filter(|(n, _)| !is_hop_by_hop(n))
         .cloned()
         .collect();
+    if SUBRESOURCE_POOL.load(std::sync::atomic::Ordering::Relaxed) {
+        return subresource_pool().fetch(url, method, &headers, body, danger_accept_invalid_host_certs);
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -984,6 +1084,112 @@ pub fn subresource_fetch(
         body,
         danger_accept_invalid_host_certs,
     ))
+}
+
+/// Page-context fetches share one runtime and one keep-alive client instead
+/// of building a runtime, a client and a TLS session per request (off = the
+/// one-shot path). Set by the embedder per render; reads are racy by design.
+pub static SUBRESOURCE_POOL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The shared page-fetch transport: a two-worker runtime and a pooled client
+/// per certificate mode. A page's ten XHRs to one origin ride one connection
+/// (h2 streams, or kept-alive h1.1) the way a browser's do. With the
+/// browser-TLS transport on, the pooled client is that transport, so a
+/// page's own requests carry the same hello as its document.
+struct SubresourcePool {
+    rt: tokio::runtime::Runtime,
+    strict: reqwest::Client,
+    lax: reqwest::Client,
+    #[cfg(feature = "impersonate")]
+    imp: Option<imp::ImpClient>,
+}
+
+fn subresource_pool() -> &'static SubresourcePool {
+    static POOL: std::sync::OnceLock<SubresourcePool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("se-page-fetch")
+            .enable_all()
+            .build()
+            .expect("page-fetch runtime");
+        let build = |lax: bool| {
+            let mut b = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .cookie_store(false)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .dns_resolver(GuardedResolver::system())
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(6);
+            if lax {
+                b = b.danger_accept_invalid_certs(true);
+            }
+            b.build().expect("page-fetch client")
+        };
+        #[cfg(feature = "impersonate")]
+        let imp = if tls_impersonate_enabled() {
+            // Redirects are followed by the caller hop by hop (the fetch
+            // spec's rewrite rules), cookies ride as an explicit header.
+            imp::ImpClient::build_subresource(GuardedResolver::system()).ok()
+        } else {
+            None
+        };
+        SubresourcePool {
+            rt,
+            strict: build(false),
+            lax: build(true),
+            #[cfg(feature = "impersonate")]
+            imp,
+        }
+    })
+}
+
+impl SubresourcePool {
+    fn fetch(
+        &self,
+        url: &str,
+        method: &str,
+        headers: &[(String, String)],
+        body: &str,
+        lax: bool,
+    ) -> Result<Response, Error> {
+        #[cfg(feature = "impersonate")]
+        if let (Some(imp), false) = (&self.imp, lax) {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in headers {
+                let (Ok(n), Ok(v)) = (
+                    reqwest::header::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) else {
+                    continue;
+                };
+                map.append(n, v);
+            }
+            let body = (!body.is_empty()).then(|| body.to_string());
+            let raw = self.rt.block_on(imp.execute(
+                method,
+                url,
+                map,
+                body,
+                MAX_SUBRESOURCE_BYTES,
+                "subresource",
+            ))?;
+            let text = decode_body(&raw.bytes, &raw.headers);
+            return Ok(Response {
+                final_url: url.to_string(),
+                status: raw.status,
+                version: raw.version,
+                headers: raw.headers,
+                body: text,
+                body_bytes: raw.bytes.into(),
+            });
+        }
+        let client = if lax { &self.lax } else { &self.strict };
+        self.rt
+            .block_on(subresource_send(client, url, method, headers, body))
+    }
 }
 
 async fn subresource_fetch_inner(
@@ -1008,6 +1214,16 @@ async fn subresource_fetch_inner(
         builder = builder.danger_accept_invalid_certs(true);
     }
     let client = builder.build()?;
+    subresource_send(&client, url, method, headers, body).await
+}
+
+async fn subresource_send(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<Response, Error> {
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Subresource(format!("bad method {method:?}: {e}")))?;
     let mut req = client.request(method, url);
@@ -1084,21 +1300,76 @@ impl Client {
         overall: std::time::Duration,
         resolver: Arc<GuardedResolver>,
     ) -> Self {
+        Self::with_transport(ua, connect, overall, resolver, tls_impersonate_enabled())
+    }
+
+    /// Is this session on the browser-TLS transport?
+    pub fn impersonating(&self) -> bool {
+        #[cfg(feature = "impersonate")]
+        {
+            self.imp.is_some()
+        }
+        #[cfg(not(feature = "impersonate"))]
+        {
+            false
+        }
+    }
+
+    /// `with_resolver` with the transport chosen by the caller instead of
+    /// the environment (`impersonate` is ignored by a binary built without
+    /// the feature).
+    #[cfg_attr(not(feature = "impersonate"), allow(unused_variables))]
+    pub fn with_transport(
+        ua: &str,
+        connect: std::time::Duration,
+        overall: std::time::Duration,
+        resolver: Arc<GuardedResolver>,
+        impersonate: bool,
+    ) -> Self {
         let store = Arc::new(SessionStore::default());
-        let inner = reqwest::Client::builder()
+        #[cfg(feature = "impersonate")]
+        let resolver_imp = resolver.clone();
+        // No `.default_headers(...)`: every request this client sends is
+        // built by hand with its own complete header map, and reqwest fills
+        // any name a request lacks from the defaults -- which put the
+        // DOCUMENT block's `Upgrade-Insecure-Requests` and `Sec-Fetch-User`
+        // on data, script and image requests (no browser sends a
+        // user-activated navigation marker on an XHR).
+        let mut builder = reqwest::Client::builder()
             .user_agent(ua)
-            .default_headers(Self::browser_headers(ua))
             .cookie_provider(store.clone())
             .connect_timeout(connect)
             .timeout(overall)
+            // A stalled origin fails at the first silent stretch this long,
+            // not only when the whole-exchange deadline runs out.
+            .read_timeout(overall.min(std::time::Duration::from_secs(15)))
             .redirect(redirect_policy())
-            .dns_resolver(resolver)
+            .dns_resolver(resolver);
+        // SE_PROXY: egress for every request of the session, so the engine
+        // leaves from the same address as the tiers below it (a clearance
+        // cookie is bound to the IP that earned it). http(s)://[user:pass@]host:port.
+        if let Some(proxy) = std::env::var("SE_PROXY")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .and_then(|p| reqwest::Proxy::all(p.trim()).ok())
+        {
+            builder = builder.proxy(proxy);
+        }
+        let inner = builder
             .build()
             .expect("reqwest client builds with default TLS");
+        #[cfg(feature = "impersonate")]
+        let imp = if impersonate {
+            imp::ImpClient::build(ua, connect, overall, resolver_imp, store.clone()).ok()
+        } else {
+            None
+        };
         Self {
             inner,
             store,
             ua: ua.to_string(),
+            #[cfg(feature = "impersonate")]
+            imp,
         }
     }
 
@@ -1170,6 +1441,21 @@ impl Client {
             reqwest::Url::parse(url).map_err(|_| Error::BadUrl(url.to_string()))?,
         );
         *req.headers_mut() = Self::document_headers(&self.ua, initiator, site);
+        #[cfg(feature = "impersonate")]
+        if let Some(imp) = &self.imp {
+            let raw = imp
+                .execute("GET", url, req.headers().clone(), None, MAX_DOCUMENT_BYTES, "document")
+                .await?;
+            let text = decode_body(&raw.bytes, &raw.headers);
+            return Ok(Response {
+                final_url: raw.final_url,
+                status: raw.status,
+                version: raw.version,
+                headers: raw.headers,
+                body: text,
+                body_bytes: raw.bytes.into(),
+            });
+        }
         let res = self.inner.execute(req).await?;
         // HTTP status rides through untouched — a 4xx/5xx response is still
         // a response (the sidecar layer decides what a refusal means), so
@@ -1306,6 +1592,32 @@ impl Client {
         // `document_headers`: hyper's h2 codec strips it before framing, and
         // from the final slot that eviction is a pure pop.
         h.insert("connection", HeaderValue::from_static("keep-alive"));
+        #[cfg(feature = "impersonate")]
+        if let Some(imp) = &self.imp {
+            let cap = match kind {
+                DataKind::Image => MAX_IMAGE_BYTES,
+                DataKind::Data => MAX_DOCUMENT_BYTES,
+            };
+            let raw = imp
+                .execute(
+                    method.as_str(),
+                    url,
+                    h,
+                    (!body.is_empty()).then(|| body.to_string()),
+                    cap,
+                    "data",
+                )
+                .await?;
+            let text = decode_body(&raw.bytes, &raw.headers);
+            return Ok(Response {
+                final_url: raw.final_url,
+                status: raw.status,
+                version: raw.version,
+                headers: raw.headers,
+                body: text,
+                body_bytes: raw.bytes.into(),
+            });
+        }
         let mut req = reqwest::Request::new(
             method,
             reqwest::Url::parse(url).map_err(|_| Error::BadUrl(url.to_string()))?,
@@ -1460,6 +1772,8 @@ impl Client {
             inner,
             store,
             ua: ua.to_string(),
+            #[cfg(feature = "impersonate")]
+            imp: None,
         }
     }
 
@@ -1709,6 +2023,44 @@ mod tests {
             assert_eq!(res.body, "hello engine", "{encoding} decoded body");
         }
         server.await.unwrap();
+    }
+
+    #[test]
+    fn charset_detect_bom_and_undeclared_legacy_bodies() {
+        let html = vec![("content-type".to_string(), "text/html".to_string())];
+        // Undeclared windows-1252: lossy UTF-8 today, detected with the switch.
+        let fr = "Les \u{e9}l\u{e8}ves fran\u{e7}ais ont d\u{e9}j\u{e0} mang\u{e9} \u{e0} la cr\u{e8}merie pr\u{e8}s de l'\u{e9}cole, o\u{f9} le caf\u{e9} est tr\u{e8}s appr\u{e9}ci\u{e9}.";
+        let page = format!("<html><body><p>{fr}</p></body></html>");
+        let w1252 = encoding_rs::WINDOWS_1252.encode(&page).0.into_owned();
+        assert!(decode_body_with(&w1252, &html, false).contains('\u{fffd}'));
+        assert_eq!(decode_body_with(&w1252, &html, true), page);
+        // Undeclared Shift_JIS and GBK.
+        let jp = "<html><body><p>\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30da}\u{30fc}\u{30b8}\u{3067}\u{3059}\u{3002}\u{3053}\u{308c}\u{306f}\u{30c6}\u{30b9}\u{30c8}\u{7528}\u{306e}\u{6587}\u{7ae0}\u{3067}\u{3042}\u{308a}\u{3001}\u{6587}\u{5b57}\u{30b3}\u{30fc}\u{30c9}\u{306e}\u{5224}\u{5b9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{307e}\u{3059}\u{3002}</p></body></html>";
+        let sjis = encoding_rs::SHIFT_JIS.encode(jp).0.into_owned();
+        assert!(decode_body_with(&sjis, &html, false).contains('\u{fffd}'));
+        assert_eq!(decode_body_with(&sjis, &html, true), jp);
+        let zh = "<html><body><p>\u{8fd9}\u{662f}\u{4e00}\u{4e2a}\u{4e2d}\u{6587}\u{7f51}\u{9875}\u{ff0c}\u{7528}\u{4e8e}\u{6d4b}\u{8bd5}\u{5b57}\u{7b26}\u{7f16}\u{7801}\u{7684}\u{81ea}\u{52a8}\u{68c0}\u{6d4b}\u{529f}\u{80fd}\u{662f}\u{5426}\u{6b63}\u{5e38}\u{5de5}\u{4f5c}\u{3002}</p></body></html>";
+        let gbk = encoding_rs::GBK.encode(zh).0.into_owned();
+        assert!(decode_body_with(&gbk, &html, false).contains('\u{fffd}'));
+        assert_eq!(decode_body_with(&gbk, &html, true), zh);
+        // A UTF-16LE BOM outranks a wrong header.
+        let mut u16le = vec![0xFF, 0xFE];
+        for u in "h\u{e9}llo".encode_utf16() {
+            u16le.extend_from_slice(&u.to_le_bytes());
+        }
+        let wrong = vec![("content-type".to_string(), "text/html; charset=iso-8859-1".to_string())];
+        assert_eq!(decode_body_with(&u16le, &wrong, true), "h\u{e9}llo");
+        // encoding_rs honours the BOM once a charset is declared; the gap was
+        // the undeclared body, which went through lossy UTF-8.
+        let plain = vec![("content-type".to_string(), "text/plain".to_string())];
+        assert_ne!(decode_body_with(&u16le, &plain, false), "h\u{e9}llo");
+        assert_eq!(decode_body_with(&u16le, &plain, true), "h\u{e9}llo");
+        // Valid UTF-8 and binary bodies are untouched by the switch.
+        let utf8 = "<p>caf\u{e9} \u{65e5}\u{672c}</p>".as_bytes();
+        assert_eq!(decode_body_with(utf8, &html, true), decode_body_with(utf8, &html, false));
+        let png = vec![("content-type".to_string(), "image/png".to_string())];
+        let bin = [0x89u8, b'P', b'N', b'G', 0, 0xff, 0xfe, 0x80];
+        assert_eq!(decode_body_with(&bin, &png, true), decode_body_with(&bin, &png, false));
     }
 
     #[tokio::test]
@@ -2056,6 +2408,44 @@ mod tests {
         format!(
             "<html><head><meta http-equiv=\"refresh\" content=\"{content}\"></head><body><p>{marker}</p></body></html>"
         )
+    }
+
+    #[tokio::test]
+    async fn meta_refresh_in_a_comment_or_script_is_not_followed() {
+        let (base, server) = spawn_meta_server(2, |path, _| {
+            let body = match path {
+                "/c" => concat!(
+                    "<html><head><!-- <meta http-equiv=\"refresh\" content=\"0; url=/landing\"> -->",
+                    "<title>caf\u{e9}</title></head><body>STAYED</body></html>"
+                )
+                .to_string(),
+                "/s" => concat!(
+                    "<html><head><script>if (old) document.write('<meta http-equiv=\"refresh\" ",
+                    "content=\"0; url=/landing\">');</script></head><body>STAYED</body></html>"
+                )
+                .to_string(),
+                _ => format!("landed at {path}"),
+            };
+            (200, "text/html", "", body)
+        })
+        .await;
+        let client = Client::new(TEST_UA);
+        for path in ["/c", "/s"] {
+            let res = client.get(&format!("{base}{path}")).await.unwrap();
+            assert!(res.final_url.ends_with(path), "{}", res.final_url);
+            assert!(res.body.contains("STAYED"));
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn mask_keeps_length_and_real_tags() {
+        let src = "<meta a><!-- <meta b> --><script x>'<meta c>'</script><meta d>".to_string();
+        let out = mask_non_markup(src.clone());
+        assert_eq!(out.len(), src.len());
+        assert_eq!(out.matches("<meta").count(), 2);
+        assert!(out.ends_with("<meta d>"));
+        assert_eq!(mask_non_markup("<!-- never closed <meta x>".into()).matches("<meta").count(), 0);
     }
 
     #[tokio::test]
@@ -2966,6 +3356,8 @@ mod tests {
             inner,
             store,
             ua: ua.to_string(),
+            #[cfg(feature = "impersonate")]
+            imp: None,
         }
     }
 
@@ -3585,5 +3977,166 @@ mod tests {
         assert_eq!(snap[0].kind, "xhr");
         assert_eq!(snap[0].method, "POST");
         assert_eq!(snap[0].status, 201);
+    }
+}
+
+/// The browser-TLS transport keeps every guarantee of the default one. Plain
+/// HTTP/1.1 against a local server: the hello itself is checked live by
+/// searchio's `bench/tlsfp.py` against a fingerprint echo.
+#[cfg(all(test, feature = "impersonate"))]
+mod impersonate_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+    fn client() -> Client {
+        let c = Client::with_transport(
+            UA,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+            GuardedResolver::system(),
+            true,
+        );
+        assert!(c.impersonating());
+        c
+    }
+
+    /// `n` sequential connections; each answered with `handle(path, request)`
+    /// = (status, extra header lines, body).
+    async fn serve<F>(n: usize, handle: F) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(&str, &str) -> (u16, String, String) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            for _ in 0..n {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16384];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, extra, body) = handle(&path, &req);
+                let out = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), h)
+    }
+
+    #[tokio::test]
+    async fn follows_redirect_and_reports_final_url() {
+        let (base, server) = serve(2, |path, _| {
+            if path == "/start" {
+                (302, "Location: /landing\r\n".into(), String::new())
+            } else {
+                (200, String::new(), format!("landed at {path}"))
+            }
+        })
+        .await;
+        let res = client().get(&format!("{base}/start")).await.unwrap();
+        assert_eq!(res.status, 200);
+        assert!(res.final_url.ends_with("/landing"), "{}", res.final_url);
+        assert_eq!(res.body, "landed at /landing");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_cookie_is_stored_and_rides_the_next_request() {
+        let (base, server) = serve(2, |path, req| {
+            if path == "/set" {
+                (200, "Set-Cookie: sid=abc; Path=/\r\n".into(), "set".into())
+            } else {
+                let cookie = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .unwrap_or("")
+                    .to_string();
+                (200, String::new(), cookie)
+            }
+        })
+        .await;
+        let c = client();
+        c.get(&format!("{base}/set")).await.unwrap();
+        let res = c.get(&format!("{base}/echo")).await.unwrap();
+        assert!(res.body.to_ascii_lowercase().contains("sid=abc"), "{}", res.body);
+        assert!(c
+            .store()
+            .cookie_header(&format!("{base}/x"))
+            .unwrap_or_default()
+            .contains("sid=abc"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn document_block_reaches_the_wire_once_and_in_order() {
+        let (base, server) = serve(1, |_, req| (200, String::new(), req.to_string())).await;
+        let res = client().get(&format!("{base}/")).await.unwrap();
+        let low = res.body.to_ascii_lowercase();
+        assert_eq!(low.matches("user-agent:").count(), 1, "{low}");
+        assert!(low.contains("chrome/145"), "{low}");
+        let pos = |name: &str| low.find(name).unwrap_or_else(|| panic!("{name} missing: {low}"));
+        assert!(pos("sec-ch-ua:") < pos("user-agent:"));
+        assert!(pos("user-agent:") < pos("accept:"));
+        assert!(pos("sec-fetch-dest:") < pos("accept-encoding:"));
+        assert!(pos("accept-encoding:") < pos("accept-language:"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_to_a_refused_target_is_a_typed_refusal() {
+        let (base, server) = serve(1, |_, _| {
+            (
+                302,
+                "Location: http://169.254.169.254/latest/meta-data/\r\n".into(),
+                String::new(),
+            )
+        })
+        .await;
+        let err = client().get(&format!("{base}/start")).await.unwrap_err();
+        assert!(matches!(err, Error::TargetRefused(_)), "{err:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_name_answer_is_not_dialed() {
+        let resolver = GuardedResolver::with_lookup(Arc::new(|_host| {
+            Box::pin(async { Ok(vec!["169.254.169.254:0".parse().unwrap()]) })
+        }));
+        let c = Client::with_transport(
+            UA,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+            resolver,
+            true,
+        );
+        let err = c.get("http://rebound.example/").await.unwrap_err();
+        assert!(matches!(err, Error::TargetRefused(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn data_call_carries_method_body_and_custom_header() {
+        let (base, server) = serve(1, |_, req| (200, String::new(), req.to_string())).await;
+        let res = client()
+            .request_data(
+                &format!("{base}/api"),
+                "POST",
+                &[("x-probe".to_string(), "1".to_string())],
+                "{\"a\":1}",
+                None,
+                DataKind::Data,
+            )
+            .await
+            .unwrap();
+        let low = res.body.to_ascii_lowercase();
+        assert!(low.starts_with("post /api"), "{low}");
+        assert!(low.contains("x-probe: 1"), "{low}");
+        assert!(low.ends_with("{\"a\":1}"), "{low}");
+        server.await.unwrap();
     }
 }

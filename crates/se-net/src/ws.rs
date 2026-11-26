@@ -35,6 +35,12 @@ pub enum WsMessage {
 
 const MAX_MESSAGE: u64 = 16 * 1024 * 1024;
 const MAX_HEADER_BLOCK: usize = 64 * 1024;
+/// TCP connect + TLS + opening handshake, as one budget.
+const CONNECT_BUDGET: Duration = Duration::from_secs(15);
+/// One outbound frame.
+const WRITE_BUDGET: Duration = Duration::from_secs(30);
+/// RFC 6455 section 5.5: a control frame carries at most 125 bytes.
+const MAX_CONTROL: u64 = 125;
 
 const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -178,6 +184,54 @@ struct FrameHead {
     payload_len: u64,
 }
 
+/// Parse a frame header from the front of `buf`: `Ok(None)` until the whole
+/// header is present. Returns the header and its length in bytes.
+fn peek_head(buf: &[u8]) -> Result<Option<(FrameHead, usize)>, Error> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let fin = buf[0] & 0x80 != 0;
+    if buf[0] & 0x70 != 0 {
+        // No extension is ever negotiated, so a reserved bit is a protocol error.
+        return Err(Error::Ws("reserved bits set".into()));
+    }
+    let opcode = buf[0] & 0x0F;
+    let masked = buf[1] & 0x80 != 0;
+    let mut at = 2usize;
+    let mut payload_len = (buf[1] & 0x7F) as u64;
+    if payload_len == 126 {
+        if buf.len() < at + 2 {
+            return Ok(None);
+        }
+        payload_len = u16::from_be_bytes([buf[at], buf[at + 1]]) as u64;
+        at += 2;
+    } else if payload_len == 127 {
+        if buf.len() < at + 8 {
+            return Ok(None);
+        }
+        let mut e = [0u8; 8];
+        e.copy_from_slice(&buf[at..at + 8]);
+        payload_len = u64::from_be_bytes(e);
+        at += 8;
+    }
+    if payload_len > MAX_MESSAGE {
+        return Err(Error::Ws(format!("frame too large: {payload_len}")));
+    }
+    if opcode >= 0x8 && (payload_len > MAX_CONTROL || !fin) {
+        return Err(Error::Ws("bad control frame (fragmented or over 125 bytes)".into()));
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        if buf.len() < at + 4 {
+            return Ok(None);
+        }
+        mask.copy_from_slice(&buf[at..at + 4]);
+        at += 4;
+    }
+    Ok(Some((FrameHead { fin, opcode, mask, payload_len }, at)))
+}
+
+#[cfg(test)]
 async fn read_head(s: &mut (impl AsyncRead + Unpin)) -> Result<FrameHead, Error> {
     let mut b = [0u8; 2];
     s.read_exact(&mut b).await.map_err(|e| Error::Ws(format!("frame head: {e}")))?;
@@ -204,6 +258,7 @@ async fn read_head(s: &mut (impl AsyncRead + Unpin)) -> Result<FrameHead, Error>
     Ok(FrameHead { fin, opcode, mask, payload_len })
 }
 
+#[cfg(test)]
 async fn read_payload(s: &mut (impl AsyncRead + Unpin), len: u64, mask: [u8; 4]) -> Result<Vec<u8>, Error> {
     let mut buf = vec![0u8; len as usize];
     s.read_exact(&mut buf).await.map_err(|e| Error::Ws(format!("frame payload: {e}")))?;
@@ -233,13 +288,73 @@ enum FrameEvent {
 pub struct WsConn {
     stream: Box<dyn Stream>,
     closed: bool,
+    /// Bytes read from the socket and not yet consumed as whole frames. The
+    /// reader only ever takes COMPLETE frames out of this buffer, so a recv
+    /// the caller abandons (the `ws_recv` long-poll timeout) loses nothing:
+    /// the next recv resumes on the same frame boundary. Reading the header
+    /// and payload straight off the socket dropped a half-read frame on that
+    /// timeout and every later frame was parsed from the middle of a payload.
+    rbuf: Vec<u8>,
+    /// A fragmented message in progress: its opcode and the bytes so far.
+    frag: Option<(u8, Vec<u8>)>,
+    /// A frame write is in flight. Still set when the next call starts means
+    /// the write was abandoned part-way: the outbound stream is desynced and
+    /// the connection is finished.
+    writing: bool,
+    last_used: std::time::Instant,
 }
 
 impl WsConn {
     /// Test-only constructor around an in-memory duplex pair.
     #[cfg(test)]
     fn from_stream(s: impl Stream + 'static) -> Self {
-        WsConn { stream: Box::new(s), closed: false }
+        WsConn::new(Box::new(s))
+    }
+
+    fn new(stream: Box<dyn Stream>) -> Self {
+        WsConn {
+            stream,
+            closed: false,
+            rbuf: Vec::new(),
+            frag: None,
+            writing: false,
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    /// Time since the last send or recv on this connection.
+    pub fn idle(&self) -> Duration {
+        self.last_used.elapsed()
+    }
+
+    /// Write one whole frame within the write budget. A write that is cut
+    /// short (budget, or the caller dropping the future) poisons the
+    /// connection instead of leaving half a frame on the wire.
+    async fn write_frame(&mut self, frame: &[u8], what: &str) -> Result<(), Error> {
+        if self.writing {
+            self.closed = true;
+            return Err(Error::Ws("connection desynced by an abandoned write".into()));
+        }
+        self.writing = true;
+        let stream = &mut self.stream;
+        let io = async {
+            stream.write_all(frame).await?;
+            stream.flush().await
+        };
+        match tokio::time::timeout(WRITE_BUDGET, io).await {
+            Ok(Ok(())) => {
+                self.writing = false;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.closed = true;
+                Err(Error::Ws(format!("{what}: {e}")))
+            }
+            Err(_) => {
+                self.closed = true;
+                Err(Error::Ws(format!("{what}: timed out")))
+            }
+        }
     }
 
     /// Send one message: text or binary.
@@ -247,10 +362,12 @@ impl WsConn {
         if self.closed {
             return Err(Error::Ws("send on closed connection".into()));
         }
+        if data.len() as u64 > MAX_MESSAGE {
+            return Err(Error::Ws(format!("message too large: {}", data.len())));
+        }
+        self.last_used = std::time::Instant::now();
         let frame = encode_frame(if text { OP_TEXT } else { OP_BINARY }, data)?;
-        self.stream.write_all(&frame).await.map_err(|e| Error::Ws(format!("send: {e}")))?;
-        self.stream.flush().await.map_err(|e| Error::Ws(format!("flush: {e}")))?;
-        Ok(())
+        self.write_frame(&frame, "send").await
     }
 
     /// The RFC 6455 closing handshake: send close(1000), keep draining until
@@ -260,8 +377,7 @@ impl WsConn {
             return Ok(());
         }
         let frame = encode_frame(OP_CLOSE, &1000u16.to_be_bytes())?;
-        let _ = self.stream.write_all(&frame).await;
-        let _ = self.stream.flush().await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.write_frame(&frame, "close")).await;
         let drain = async {
             loop {
                 match self.next_frame().await {
@@ -274,66 +390,117 @@ impl WsConn {
         Ok(())
     }
 
+    /// Take one whole frame off the front of the buffer, unmasked.
+    fn take_frame(&mut self) -> Result<Option<(FrameHead, Vec<u8>)>, Error> {
+        let Some((head, hlen)) = peek_head(&self.rbuf)? else {
+            return Ok(None);
+        };
+        let total = hlen + head.payload_len as usize;
+        if self.rbuf.len() < total {
+            return Ok(None);
+        }
+        let mut payload = self.rbuf[hlen..total].to_vec();
+        if head.mask != [0; 4] {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= head.mask[i % 4];
+            }
+        }
+        self.rbuf.drain(..total);
+        Ok(Some((head, payload)))
+    }
+
+    /// Cancel-safe: the only await that can be abandoned without loss is the
+    /// socket `read`, and nothing is consumed from `rbuf` except whole frames.
     async fn next_frame(&mut self) -> Result<Option<FrameEvent>, Error> {
         if self.closed {
             return Ok(None);
         }
-        let head = read_head(&mut self.stream).await?;
-        match head.opcode {
-            OP_PING => {
-                let payload = read_payload(&mut self.stream, head.payload_len, head.mask).await?;
-                let pong = encode_frame(OP_PONG, &payload)?;
-                self.stream.write_all(&pong).await.map_err(|e| Error::Ws(format!("pong: {e}")))?;
-                self.stream.flush().await.map_err(|e| Error::Ws(format!("flush: {e}")))?;
-                Ok(Some(FrameEvent::Ping))
-            }
-            OP_PONG => {
-                let payload = read_payload(&mut self.stream, head.payload_len, head.mask).await?;
-                Ok(Some(FrameEvent::Message(WsMessage::Pong(payload))))
-            }
-            OP_CLOSE => {
-                let payload = read_payload(&mut self.stream, head.payload_len, head.mask).await?;
-                let (code, reason) = close_parts(&payload);
-                self.closed = true;
-                // §5.5.1: if we didn't initiate, echo the close frame back.
-                let echo = encode_frame(OP_CLOSE, &payload)?;
-                let _ = self.stream.write_all(&echo).await;
-                let _ = self.stream.flush().await;
-                Ok(Some(FrameEvent::Message(WsMessage::Close { code, reason })))
-            }
-            OP_TEXT | OP_BINARY => {
-                let mut payload = read_payload(&mut self.stream, head.payload_len, head.mask).await?;
-                if !head.fin {
-                    // Fragmentation: drain continuations until FIN.
-                    loop {
-                        let cont = read_head(&mut self.stream).await?;
-                        if cont.opcode != OP_CONT {
-                            return Err(Error::Ws(format!(
-                                "expected continuation, got opcode {}",
-                                cont.opcode
-                            )));
-                        }
-                        let piece = read_payload(&mut self.stream, cont.payload_len, cont.mask).await?;
-                        payload.extend_from_slice(&piece);
-                        if payload.len() as u64 > MAX_MESSAGE {
-                            return Err(Error::Ws("message too large".into()));
-                        }
-                        if cont.fin {
-                            break;
-                        }
-                    }
+        if self.writing {
+            self.closed = true;
+            return Err(Error::Ws("connection desynced by an abandoned write".into()));
+        }
+        loop {
+            let frame = match self.take_frame() {
+                Ok(f) => f,
+                Err(e) => {
+                    self.closed = true;
+                    return Err(e);
                 }
-                if head.opcode == OP_TEXT {
-                    match String::from_utf8(payload) {
-                        Ok(s) => Ok(Some(FrameEvent::Message(WsMessage::Text(s)))),
-                        Err(_) => Err(Error::Ws("invalid utf-8 text frame".into())),
+            };
+            let Some((head, payload)) = frame else {
+                let mut chunk = [0u8; 16 * 1024];
+                let n = self
+                    .stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| Error::Ws(format!("frame read: {e}")))?;
+                if n == 0 {
+                    self.closed = true;
+                    return Err(Error::Ws("frame read: connection closed".into()));
+                }
+                self.rbuf.extend_from_slice(&chunk[..n]);
+                continue;
+            };
+            self.last_used = std::time::Instant::now();
+            match head.opcode {
+                OP_PING => {
+                    let pong = encode_frame(OP_PONG, &payload)?;
+                    self.write_frame(&pong, "pong").await?;
+                    return Ok(Some(FrameEvent::Ping));
+                }
+                OP_PONG => return Ok(Some(FrameEvent::Message(WsMessage::Pong(payload)))),
+                OP_CLOSE => {
+                    let (code, reason) = close_parts(&payload);
+                    // Section 5.5.1: if we didn't initiate, echo the close back.
+                    let echo = encode_frame(OP_CLOSE, &payload)?;
+                    let _ = self.write_frame(&echo, "close").await;
+                    self.closed = true;
+                    return Ok(Some(FrameEvent::Message(WsMessage::Close { code, reason })));
+                }
+                OP_TEXT | OP_BINARY => {
+                    if self.frag.is_some() {
+                        self.closed = true;
+                        return Err(Error::Ws("new message inside a fragmented one".into()));
                     }
-                } else {
-                    Ok(Some(FrameEvent::Message(WsMessage::Binary(payload))))
+                    if head.fin {
+                        return self.finish(head.opcode, payload).map(Some);
+                    }
+                    self.frag = Some((head.opcode, payload));
+                }
+                OP_CONT => {
+                    let Some((opcode, mut sofar)) = self.frag.take() else {
+                        self.closed = true;
+                        return Err(Error::Ws("unexpected continuation frame".into()));
+                    };
+                    sofar.extend_from_slice(&payload);
+                    if sofar.len() as u64 > MAX_MESSAGE {
+                        self.closed = true;
+                        return Err(Error::Ws("message too large".into()));
+                    }
+                    if head.fin {
+                        return self.finish(opcode, sofar).map(Some);
+                    }
+                    self.frag = Some((opcode, sofar));
+                }
+                other => {
+                    self.closed = true;
+                    return Err(Error::Ws(format!("unknown opcode {other}")));
                 }
             }
-            OP_CONT => Err(Error::Ws("unexpected continuation frame".into())),
-            other => Err(Error::Ws(format!("unknown opcode {other}"))),
+        }
+    }
+
+    fn finish(&mut self, opcode: u8, payload: Vec<u8>) -> Result<FrameEvent, Error> {
+        if opcode == OP_TEXT {
+            match String::from_utf8(payload) {
+                Ok(s) => Ok(FrameEvent::Message(WsMessage::Text(s))),
+                Err(_) => {
+                    self.closed = true;
+                    Err(Error::Ws("invalid utf-8 text frame".into()))
+                }
+            }
+        } else {
+            Ok(FrameEvent::Message(WsMessage::Binary(payload)))
         }
     }
 
@@ -387,6 +554,23 @@ pub struct HandshakeCtx {
 /// authentication challenge or a Sec-WebSocket-Protocol negotiation lands
 /// there).
 pub async fn connect(url: &str, ctx: &HandshakeCtx) -> Result<(WsConn, Vec<(String, String)>), Error> {
+    connect_within(url, ctx, CONNECT_BUDGET).await
+}
+
+/// `connect` with an explicit budget for TCP + TLS + the opening handshake. A
+/// peer that accepts and then says nothing used to hold the verb forever.
+pub async fn connect_within(
+    url: &str,
+    ctx: &HandshakeCtx,
+    budget: Duration,
+) -> Result<(WsConn, Vec<(String, String)>), Error> {
+    match tokio::time::timeout(budget, connect_inner(url, ctx)).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Ws(format!("connect: timed out after {} ms", budget.as_millis()))),
+    }
+}
+
+async fn connect_inner(url: &str, ctx: &HandshakeCtx) -> Result<(WsConn, Vec<(String, String)>), Error> {
     let u = url::Url::parse(url).map_err(|e| Error::Ws(format!("bad url: {e}")))?;
     let secure = match u.scheme() {
         "ws" => false,
@@ -399,7 +583,21 @@ pub async fn connect(url: &str, ctx: &HandshakeCtx) -> Result<(WsConn, Vec<(Stri
         .to_string();
     let port = u.port_or_known_default().ok_or_else(|| Error::Ws("missing port".into()))?;
 
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+    // The same address policy as every HTTP client in the crate: an answer in
+    // a refused class (link-local = cloud metadata, unspecified) poisons the
+    // dial. This path used to dial whatever the name resolved to.
+    let lookup_host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((lookup_host.as_str(), port))
+        .await
+        .map_err(|e| Error::Ws(format!("resolve {host}: {e}")))?
+        .collect();
+    if let Some(why) = addrs.iter().find_map(|a| crate::refused_ip(a.ip())) {
+        return Err(Error::Ws(format!("refused target {host}: {why}")));
+    }
+    if addrs.is_empty() {
+        return Err(Error::Ws(format!("resolve {host}: no addresses")));
+    }
+    let tcp = tokio::net::TcpStream::connect(&addrs[..])
         .await
         .map_err(|e| Error::Ws(format!("connect {host}:{port}: {e}")))?;
     tcp.set_nodelay(true).map_err(|e| Error::Ws(format!("tcp: {e}")))?;
@@ -424,7 +622,7 @@ pub async fn connect(url: &str, ctx: &HandshakeCtx) -> Result<(WsConn, Vec<(Stri
         Box::new(tcp)
     };
 
-    let mut conn = WsConn { stream, closed: false };
+    let mut conn = WsConn::new(stream);
     let headers = handshake(&mut conn, &u, &host, port, secure, ctx).await?;
     Ok((conn, headers))
 }
@@ -486,9 +684,16 @@ async fn handshake(
     conn.stream.flush().await.map_err(|e| Error::Ws(format!("flush: {e}")))?;
 
     // Read the status + headers until the blank line, capped.
+    // A server may put its first frame in the same segment as the 101: the
+    // header block ends at the FIRST blank line and everything after it is
+    // frame data. Waiting for the buffer to END with the blank line read
+    // those frame bytes as headers (and then hung, or ran to the cap).
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
-    while !buf.ends_with(b"\r\n\r\n") {
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
         if buf.len() > MAX_HEADER_BLOCK {
             return Err(Error::Ws("handshake headers too large".into()));
         }
@@ -501,7 +706,9 @@ async fn handshake(
             return Err(Error::Ws("handshake: connection closed".into()));
         }
         buf.extend_from_slice(&chunk[..n]);
-    }
+    };
+    conn.rbuf.extend_from_slice(&buf[head_end..]);
+    buf.truncate(head_end);
 
     let head = String::from_utf8_lossy(&buf);
     let mut lines = head.split("\r\n");
@@ -665,6 +872,131 @@ mod tests {
         let payload: Vec<u8> = got[6..].iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
         assert_eq!(&payload[..2], &1000u16.to_be_bytes());
         assert_eq!(&payload[2..], b"done");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_recv_does_not_desync_the_stream() {
+        let (mut server, client) = duplex(4096);
+        let mut conn = WsConn::from_stream(client);
+        // Header and half the payload of "hello world", then silence.
+        server.write_all(&[0x81, 0x0B]).await.unwrap();
+        server.write_all(b"hello").await.unwrap();
+        let timed_out = tokio::time::timeout(Duration::from_millis(60), conn.recv()).await;
+        assert!(timed_out.is_err(), "half a frame is not a message");
+        // The rest arrives, then a second message.
+        server.write_all(b" world").await.unwrap();
+        server.write_all(&[0x81, 0x02]).await.unwrap();
+        server.write_all(b"ok").await.unwrap();
+        assert_eq!(conn.recv().await.unwrap(), WsMessage::Text("hello world".into()));
+        assert_eq!(conn.recv().await.unwrap(), WsMessage::Text("ok".into()));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_recv_mid_fragment_keeps_the_pieces() {
+        let (mut server, client) = duplex(4096);
+        let mut conn = WsConn::from_stream(client);
+        server.write_all(&[0x01, 0x03]).await.unwrap();
+        server.write_all(b"Hel").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(60), conn.recv()).await.is_err());
+        server.write_all(&[0x80, 0x02]).await.unwrap();
+        server.write_all(b"lo").await.unwrap();
+        assert_eq!(conn.recv().await.unwrap(), WsMessage::Text("Hello".into()));
+    }
+
+    #[tokio::test]
+    async fn a_ping_between_fragments_is_answered_not_fatal() {
+        let (mut server, client) = duplex(4096);
+        let mut script = Vec::new();
+        script.extend_from_slice(&[0x01, 0x03]);
+        script.extend_from_slice(b"Hel");
+        script.extend_from_slice(&[0x89, 0x01, b'p']); // ping inside the message
+        script.extend_from_slice(&[0x80, 0x02]);
+        script.extend_from_slice(b"lo");
+        server.write_all(&script).await.unwrap();
+        let mut conn = WsConn::from_stream(client);
+        assert_eq!(conn.recv().await.unwrap(), WsMessage::Text("Hello".into()));
+        let mut got = vec![0u8; 2 + 4 + 1];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(got[0], 0x8A, "the ping was answered");
+    }
+
+    #[tokio::test]
+    async fn bad_control_frames_and_reserved_bits_are_refused() {
+        for script in [
+            vec![0x89u8, 0x7E, 0x00, 0x7E], // ping claiming 126 bytes
+            vec![0x09, 0x00],               // fragmented ping
+            vec![0xC1, 0x00],               // RSV1 with no extension negotiated
+        ] {
+            let (mut server, client) = duplex(64);
+            server.write_all(&script).await.unwrap();
+            let mut conn = WsConn::from_stream(client);
+            assert!(conn.recv().await.is_err(), "{script:02x?}");
+            // A protocol error finishes the connection.
+            assert!(conn.send(b"x", true).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_sent_with_the_101_is_not_lost() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+            }
+            let text = String::from_utf8_lossy(&req).to_string();
+            let key = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                .unwrap()
+                .trim()
+                .to_string();
+            // 101 and the first frame in ONE write.
+            let mut out = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept_key(&key)
+            )
+            .into_bytes();
+            out.extend_from_slice(&[0x81, 0x05]);
+            out.extend_from_slice(b"early");
+            sock.write_all(&out).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let ctx = HandshakeCtx { ua: "t".into(), origin: None, cookie: None, headers: vec![] };
+        let (mut conn, headers) = connect(&format!("ws://127.0.0.1:{port}/"), &ctx).await.unwrap();
+        assert!(headers.iter().any(|(k, _)| k == "sec-websocket-accept"));
+        let got = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
+        assert_eq!(got.expect("the early frame is delivered").unwrap(), WsMessage::Text("early".into()));
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_fails_the_connect_inside_the_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await; // accepts, never answers
+        });
+        let ctx = HandshakeCtx { ua: "t".into(), origin: None, cookie: None, headers: vec![] };
+        let t0 = std::time::Instant::now();
+        let err = connect_within(&format!("ws://127.0.0.1:{port}/"), &ctx, Duration::from_millis(200))
+            .await
+            .err()
+            .expect("no handshake answer is a failure")
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_link_local_target_is_refused_before_the_dial() {
+        let ctx = HandshakeCtx { ua: "t".into(), origin: None, cookie: None, headers: vec![] };
+        let err = connect("ws://169.254.169.254/latest", &ctx).await.err().unwrap().to_string();
+        assert!(err.contains("refused target") && err.contains("link_local"), "{err}");
     }
 
     #[tokio::test]

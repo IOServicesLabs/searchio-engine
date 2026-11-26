@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use scraper::{ElementRef, Html, Selector};
 
+pub mod jsontree;
 pub mod snapshot;
 
 // `ns!()` expands to `namespace_url!()`, a markup5ever `#[macro_export]`

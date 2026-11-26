@@ -5,10 +5,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 scraper = "0.23"
 thiserror = "2"
+
+# Opt-in release tuning: `cargo build --profile fast -p se-serve`. Kept as a
+# separate profile until parbench shows it earns its longer build.
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
